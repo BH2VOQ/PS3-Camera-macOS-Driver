@@ -59,6 +59,7 @@ public:
 	bool init(uint32_t width = 0, uint32_t height = 0, uint16_t desiredFrameRate = 30, EOutputFormat outputFormat = EOutputFormat::BGR);
 	void start();
 	void stop();
+	void setLed(bool on); // 仅控制 LED（纯寄存器写，安全；不启停传输流，避免 stop() 的 libusb 竞态崩溃）
 
 	// Controls
 

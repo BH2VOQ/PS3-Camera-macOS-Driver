@@ -1156,6 +1156,15 @@ void PS3EYECam::stop()
     is_streaming = false;
 }
 
+// 仅切换 LED，不启停传输流。
+// ⚠️ 不能依赖 stop()/start() 做空闲省电：stop() 先写 0xe0=0x09 停流，
+// 在途 transfer 随即出错，回调在传输线程内 close_transfers() 与 handle_events 自锁 → 断言崩溃（实测）。
+void PS3EYECam::setLed(bool on)
+{
+    if (!isInitialized()) return;
+    ov534_set_led(on ? 1 : 0);
+}
+
 #define MAX_USB_DEVICE_PORT_PATH 7
 
 bool PS3EYECam::getUSBPortPath(char *out_identifier, size_t max_identifier_length) const

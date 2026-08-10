@@ -121,7 +121,12 @@ static bool findSinkStream(CMIOObjectID *outDevice, CMIOStreamID *outSinkStream,
                 if (qs == noErr && q) {
                     *outDevice = devices[i];
                     *outSinkStream = streams[si];
-                    *outQueue = q;
+                    if (outQueue) {
+                        *outQueue = q;
+                    } else {
+                        // 只发现不保留（动态开关 sink 时队列由 openSink/closeSink 管理）
+                        CFRelease(q);
+                    }
                     fprintf(stderr, "  -> using stream[%u] as sink (OBS 官方 index 1)\n", si);
                     return true;
                 }
@@ -185,30 +190,23 @@ int main(int argc, char *argv[]) {
         signal(SIGINT, on_signal);
         signal(SIGTERM, on_signal);
 
+        // 发现 sink：只定位设备+流，不启动（启动由消费者到达时动态进行）
         CMIOObjectID device = 0;
         CMIOStreamID sink = 0;
         CMSimpleQueueRef queue = NULL;
-        if (!findSinkStream(&device, &sink, &queue)) {
+        if (!findSinkStream(&device, &sink, NULL)) {
             fprintf(stderr, "[ps3eye-feed] ERROR: OBS Virtual Camera not found/not activated. 请先安装 OBS 并 Start Virtual Camera 一次。\n");
             return 2;
         }
 
-        OSStatus st = CMIODeviceStartStream(device, sink);
-        if (st != noErr) {
-            fprintf(stderr, "[ps3eye-feed] ERROR: CMIODeviceStartStream %d\n", st);
-            return 3;
-        }
-        fprintf(stderr, "[ps3eye-feed] sink stream started\n");
-
-        // ps3eye 初始化
+        // ps3eye 初始化（只 init；start/stop 由消费者状态驱动）
         auto &devs = ps3eye::PS3EYECam::getDevices();
         if (devs.empty()) { fprintf(stderr, "[ps3eye-feed] ERROR: no PS3 Eye\n"); return 4; }
         auto cam = devs[0];
         if (!cam->init((uint32_t)kWidth, (uint32_t)kHeight, 60)) {
             fprintf(stderr, "[ps3eye-feed] ERROR: camera init failed\n"); return 5;
         }
-        cam->start();
-        fprintf(stderr, "[ps3eye-feed] PS3 Eye streaming (Ctrl+C 退出)\n");
+        fprintf(stderr, "[ps3eye-feed] PS3 Eye ready (待机中，消费者到达自动启动)\n");
 
         // NV12 像素缓冲池（与 OBS 官方一致：VIDEO_FORMAT_NV12 → 420YpCbCr8BiPlanarVideoRange）
         // 关键：必须 IOSurface-backed，CMIOExtension 跨进程传帧走 XPC 序列化，
@@ -235,48 +233,103 @@ int main(int argc, char *argv[]) {
         int64_t lastSendNs = 0;
         uint64_t frameCount = 0;
 
-        // 无消费者自动停摄像头（用户需求）：用 AVFoundation isInUseByAnotherApplication 检测。
-        // ⚠️ 不用 kCMIODevicePropertyDeviceIsRunning：feed 自己启动了 sink 流，该属性恒=1（实测）。
-        // AVFoundation 查询：Photo Booth 等 App 打开 OBS Virtual Camera 时 isInUse 变 1；
-        // feed 用 CMIO 不算 AVFoundation 使用者（实测恒 0），所以这是可靠的「真消费者」信号。
-        bool camRunning = true;
-        // ⚠️ 必须初始化为当前时间！若为 0，第一次循环 nowNs-0 >= 1s 立即成立，
-        // 启动瞬间就 cam->stop() → 与刚起步的 USB 传输线程竞态 → libusb 互斥锁断言崩溃
-        int64_t lastCheckNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-        const int64_t kCheckInterval = NSEC_PER_SEC; // 每秒检查一次
-
-        // 消费者检测：读独立进程 consumer_watch 写入的结果文件（/tmp/ps3eye_consumer.txt）。
-        // ⚠️ 不能在 feed 进程内直接调 AVFoundation（devicesWithMediaType 枚举会与 libusb
-        // 并发冲突导致 pthread_mutex_lock 断言崩溃，实测验证过）。独立进程方案已验证安全。
-        auto checkConsumer = [&]() -> bool {
-            FILE *f = fopen("/tmp/ps3eye_consumer.txt", "r");
-            if (!f) return false; // 文件不存在视为无消费者
-            int v = 0;
-            if (fscanf(f, "%d", &v) != 1) v = 0;
-            fclose(f);
-            return v != 0;
+        // ---- 消费者检测：CMIO kCMIODevicePropertyDeviceIsRunningSomewhere ----
+        // ⚠️ 实测：该属性会被「我们自己开着的 sink 流」顶成恒 1（消费者走后不复位），
+        // 也会被 AVFoundation isInUse（扩展未实现，恒 0）之外的任何 source 消费者置 1。
+        // 因此采用双态机：
+        //   IDLE（sink 关）：轮询 gone = 真实消费者信号（此时无自己的 sink 污染）；
+        //   ACTIVE（sink 开）：每 4s 做「眨眼探测」——关 sink 50ms → 查 gone →
+        //     消费者还在（source 仍在跑）→ 重开 sink；走了 → 停摄像头回 IDLE。
+        // 探测代价：消费者每 4s 丢 1~2 帧（≈50ms 冻结），人眼基本无感。
+        auto queryRunningSomewhere = [&]() -> bool {
+            UInt32 v = 0;
+            CMIOObjectPropertyAddress addr = {kCMIODevicePropertyDeviceIsRunningSomewhere,
+                                              kCMIOObjectPropertyScopeGlobal,
+                                              kCMIOObjectPropertyElementMain};
+            UInt32 sz = sizeof(v);
+            OSStatus s = CMIOObjectGetPropertyData(device, &addr, 0, NULL, sz, &sz, &v);
+            return (s == noErr) && (v != 0);
+        };
+        auto openSink = [&]() -> bool {
+            CMSimpleQueueRef q = NULL;
+            OSStatus qs = CMIOStreamCopyBufferQueue(sink,
+                                                    [](CMIOStreamID, void *, void *) {},
+                                                    NULL, &q);
+            if (qs != noErr || !q) {
+                fprintf(stderr, "[ps3eye-feed] openSink: CopyBufferQueue failed %d\n", qs);
+                return false;
+            }
+            OSStatus st = CMIODeviceStartStream(device, sink);
+            if (st != noErr) {
+                CFRelease(q);
+                fprintf(stderr, "[ps3eye-feed] openSink: StartStream failed %d\n", st);
+                return false;
+            }
+            queue = q;
+            fprintf(stderr, "[ps3eye-feed] sink stream started\n");
+            return true;
+        };
+        auto closeSink = [&]() {
+            CMIODeviceStopStream(device, sink);
+            if (queue) { CFRelease(queue); queue = NULL; }
         };
 
+        enum { ST_IDLE, ST_ACTIVE } state = ST_IDLE;
+        bool camStarted = false;   // cam->start() 只做一次（stop() 有 libusb 自锁崩溃风险，绝不复用）
+        bool camRunning = false;   // 当前是否在向 sink 推帧
+        int64_t lastPollNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);  // IDLE 轮询
+        int64_t lastProbeNs = 0;                                        // ACTIVE 探测
+        const int64_t kPollIntervalNs = NSEC_PER_SEC;                   // IDLE: 1s
+        const int64_t kProbeIntervalNs = 4 * NSEC_PER_SEC;              // ACTIVE: 4s
+
         while (g_running) {
-            // 周期性消费者检测（每秒一次）
             int64_t nowNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-            if (nowNs - lastCheckNs >= kCheckInterval) {
-                lastCheckNs = nowNs;
-                bool consumerActive = checkConsumer();
-                if (!consumerActive && camRunning) {
-                    cam->stop();
-                    camRunning = false;
+
+            if (state == ST_IDLE) {
+                if (nowNs - lastPollNs >= kPollIntervalNs) {
+                    lastPollNs = nowNs;
+                    if (queryRunningSomewhere()) {
+                        // 首次消费者：启动摄像头（只一次，之后常开）
+                        if (!camStarted) {
+                            cam->start();
+                            camStarted = true;
+                        }
+                        if (openSink()) {
+                            cam->setLed(true);
+                            camRunning = true;
+                            lastProbeNs = nowNs;
+                            state = ST_ACTIVE;
+                            fprintf(stderr, "[ps3eye-feed] 检测到消费者，摄像头已恢复\n");
+                        }
+                    }
+                }
+                usleep(200 * 1000);
+                continue;
+            }
+
+            // ST_ACTIVE：周期性眨眼探测
+            if (nowNs - lastProbeNs >= kProbeIntervalNs) {
+                lastProbeNs = nowNs;
+                closeSink();
+                usleep(50 * 1000);
+                if (queryRunningSomewhere()) {
+                    if (openSink()) {
+                        fprintf(stderr, "[ps3eye-feed] 消费者仍在，sink 已重开\n");
+                    } else {
+                        cam->setLed(false);
+                        camRunning = false; state = ST_IDLE;
+                        fprintf(stderr, "[ps3eye-feed] 重开 sink 失败，转待机\n");
+                    }
+                } else {
+                    // 摄像头保持常开（避免 libusb stop 竞态崩溃），只关 LED + 关 sink
+                    cam->setLed(false);
+                    camRunning = false; state = ST_IDLE;
                     fprintf(stderr, "[ps3eye-feed] 无消费者，摄像头已停止 (省电)\n");
-                } else if (consumerActive && !camRunning) {
-                    cam->start();
-                    camRunning = true;
-                    fprintf(stderr, "[ps3eye-feed] 检测到消费者，摄像头已恢复\n");
                 }
             }
 
-            if (!camRunning) {
-                // 省电模式：不抓帧不喂帧，独立等待循环（每秒检查消费者是否回来）
-                usleep(200 * 1000);
+            if (!camRunning || !queue) {
+                usleep(100 * 1000);
                 continue;
             }
 
@@ -318,10 +371,10 @@ int main(int argc, char *argv[]) {
             pts = CMTimeAdd(pts, duration);
         }
 
-        // 优雅退出
+        // 优雅退出（不调 cam->stop()：libusb 自锁崩溃风险；进程退出由 OS 回收传输）
         fprintf(stderr, "[ps3eye-feed] stopping...\n");
-        CMIODeviceStopStream(device, sink);
-        cam->stop();
+        closeSink();
+        if (camStarted) cam->setLed(false);
         if (pool) CVPixelBufferPoolRelease(pool);
         if (fmt) CFRelease(fmt);
         fprintf(stderr, "[ps3eye-feed] cleaned up, bye\n");
