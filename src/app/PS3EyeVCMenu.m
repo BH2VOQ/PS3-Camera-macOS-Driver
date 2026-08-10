@@ -6,7 +6,12 @@
 #import <Cocoa/Cocoa.h>
 
 #define AGENT_LABEL @"com.bh2voq.ps3eye-vcam"
+#define APP_AGENT_LABEL @"com.bh2voq.ps3eye-vcam-app"
 #define FEED_NAME  @"ps3eye-feed"
+
+static NSString *appAgentPlistPath(void) {
+    return [NSHomeDirectory() stringByAppendingPathComponent:@"Library/LaunchAgents/com.bh2voq.ps3eye-vcam-app.plist"];
+}
 
 static NSString *supportDir(void) {
     return [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/PS3Eye-VirtualCam"];
@@ -103,6 +108,43 @@ static void stopAgent(void) {
     runShell(cmd);
 }
 
+static BOOL appAgentLoaded(void) {
+    NSString *cmd = [NSString stringWithFormat:@"launchctl print gui/%@/%@ >/dev/null 2>&1", uidString(), APP_AGENT_LABEL];
+    return runShell(cmd) == 0;
+}
+
+// 注册 App 自身开机自启（菜单栏图标登录即有）；App 路径变化时更新 plist
+static void ensureAppAgent(void) {
+    NSString *appBin = [[NSBundle mainBundle] executablePath];
+    if (!appBin) return;
+    NSString *plistPath = appAgentPlistPath();
+    NSString *existing = [NSString stringWithContentsOfFile:plistPath encoding:NSUTF8StringEncoding error:nil];
+    BOOL needsWrite = !(existing && [existing containsString:appBin]);
+    if (needsWrite) {
+        if (appAgentLoaded()) {
+            NSString *un = [NSString stringWithFormat:@"launchctl bootout gui/%@/%@ 2>/dev/null; true", uidString(), APP_AGENT_LABEL];
+            runShell(un);
+        }
+        NSString *plist = [NSString stringWithFormat:
+            @"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+            @"<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+            @"<plist version=\"1.0\">\n"
+            @"<dict>\n"
+            @"\t<key>Label</key><string>%@</string>\n"
+            @"\t<key>ProgramArguments</key>\n"
+            @"\t<array><string>%@</string></array>\n"
+            @"\t<key>RunAtLoad</key><true/>\n"
+            @"\t<key>ProcessType</key><string>Background</string>\n"
+            @"</dict>\n"
+            @"</plist>\n", APP_AGENT_LABEL, appBin];
+        [plist writeToFile:plistPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
+    if (!appAgentLoaded()) {
+        NSString *cmd = [NSString stringWithFormat:@"launchctl bootstrap gui/%@ %@ 2>&1; true", uidString(), plistPath];
+        runShell(cmd);
+    }
+}
+
 @interface AppDelegate : NSObject <NSApplicationDelegate>
 @property NSStatusItem *statusItem;
 @property NSMenuItem *statusMenuItem;
@@ -125,6 +167,14 @@ static void stopAgent(void) {
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
+    // 单实例守护：bootstrap 自启可能再拉起一份 → 后到者退出
+    NSArray<NSRunningApplication *> *instances =
+        [NSRunningApplication runningApplicationsWithBundleIdentifier:@"com.bh2voq.ps3eye-vcam"];
+    if (instances.count > 1) {
+        [NSApp terminate:nil];
+        return;
+    }
+
     self.statusItem = [[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength];
     NSMenu *menu = [[NSMenu alloc] init];
 
@@ -149,9 +199,10 @@ static void stopAgent(void) {
     self.statusItem.menu = menu;
     [self refresh:nil];
 
-    // 首次启动：自动安装（拷贝驱动 + 注册 LaunchAgent）+ 拉起常驻
+    // 首次启动：自动安装（拷贝驱动 + 注册 LaunchAgent）+ 拉起常驻；注册 App 自身开机自启
     if (ensureInstalled()) {
         startAgent();
+        ensureAppAgent();
     } else {
         NSAlert *a = [[NSAlert alloc] init];
         a.messageText = @"安装失败";
