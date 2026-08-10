@@ -1,22 +1,32 @@
 // PS3EyeVCMenu.m — PS3 Eye 虚拟摄像头菜单栏控制 App
-// 双击启动 → 自动拉起 ps3eye-feed；菜单栏显示状态（待机/推流中/未运行）；
-// 菜单可手动启停、打开日志；退出 App 时自动停止 feed。
+// 架构：驱动通过 LaunchAgent（com.bh2voq.ps3eye-vcam）常驻后台——
+// 开机自启、崩溃自动拉起、退出 App 不影响驱动。App 只负责：
+//   首次启动自动安装（拷贝驱动到 Application Support + 注册 LaunchAgent）
+//   菜单栏状态显示（待机/推流中/未运行）、手动启停、打开日志
 #import <Cocoa/Cocoa.h>
 
-static NSString *feedPath(void) {
-    return [[NSBundle mainBundle] pathForResource:@"ps3eye-feed" ofType:nil];
-}
+#define AGENT_LABEL @"com.bh2voq.ps3eye-vcam"
+#define FEED_NAME  @"ps3eye-feed"
 
+static NSString *supportDir(void) {
+    return [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/PS3Eye-VirtualCam"];
+}
+static NSString *installedFeedPath(void) {
+    return [supportDir() stringByAppendingPathComponent:FEED_NAME];
+}
+static NSString *agentPlistPath(void) {
+    return [NSHomeDirectory() stringByAppendingPathComponent:@"Library/LaunchAgents/com.bh2voq.ps3eye-vcam.plist"];
+}
 static NSString *logPath(void) {
     NSString *dir = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Logs/PS3Eye-VirtualCam"];
     [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
     return [dir stringByAppendingPathComponent:@"feed.log"];
 }
 
-static BOOL feedRunning(void) {
+static int runShell(NSString *cmd) {
     NSTask *t = [[NSTask alloc] init];
     t.executableURL = [NSURL fileURLWithPath:@"/bin/bash"];
-    t.arguments = @[@"-lc", @"pgrep -x ps3eye-feed >/dev/null 2>&1"];
+    t.arguments = @[@"-lc", cmd];
     NSPipe *p = [NSPipe pipe];
     t.standardOutput = p;
     t.standardError = p;
@@ -24,19 +34,73 @@ static BOOL feedRunning(void) {
         [t launch];
         [t waitUntilExit];
     } @catch (NSException *e) {
-        return NO;
+        return -1;
     }
-    return t.terminationStatus == 0;
+    return t.terminationStatus;
 }
 
-static void killFeed(void) {
-    NSTask *t = [[NSTask alloc] init];
-    t.executableURL = [NSURL fileURLWithPath:@"/bin/bash"];
-    t.arguments = @[@"-lc", @"pkill -x ps3eye-feed 2>/dev/null; true"];
-    @try {
-        [t launch];
-        [t waitUntilExit];
-    } @catch (NSException *e) {}
+static NSString *uidString(void) {
+    return [NSString stringWithFormat:@"%d", (int)getuid()];
+}
+
+static BOOL feedRunning(void) {
+    return runShell(@"pgrep -x ps3eye-feed >/dev/null 2>&1") == 0;
+}
+
+static BOOL agentLoaded(void) {
+    NSString *cmd = [NSString stringWithFormat:@"launchctl print gui/%@/%@ >/dev/null 2>&1", uidString(), AGENT_LABEL];
+    return runShell(cmd) == 0;
+}
+
+// 安装：拷贝驱动 + 写 LaunchAgent plist + bootstrap
+static BOOL ensureInstalled(void) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    [fm createDirectoryAtPath:supportDir() withIntermediateDirectories:YES attributes:nil error:nil];
+
+    NSString *bundled = [[NSBundle mainBundle] pathForResource:FEED_NAME ofType:nil];
+    if (bundled && ![fm fileExistsAtPath:installedFeedPath()]) {
+        [fm copyItemAtPath:bundled toPath:installedFeedPath() error:nil];
+    }
+    if (![fm fileExistsAtPath:installedFeedPath()]) return NO;
+
+    if (![fm fileExistsAtPath:agentPlistPath()]) {
+        NSString *plist = [NSString stringWithFormat:
+            @"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+            @"<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+            @"<plist version=\"1.0\">\n"
+            @"<dict>\n"
+            @"\t<key>Label</key><string>%@</string>\n"
+            @"\t<key>ProgramArguments</key>\n"
+            @"\t<array><string>%@</string></array>\n"
+            @"\t<key>RunAtLoad</key><true/>\n"
+            @"\t<key>KeepAlive</key><true/>\n"
+            @"\t<key>ThrottleInterval</key><integer>10</integer>\n"
+            @"\t<key>ProcessType</key><string>Background</string>\n"
+            @"\t<key>StandardOutPath</key><string>%@</string>\n"
+            @"\t<key>StandardErrorPath</key><string>%@</string>\n"
+            @"</dict>\n"
+            @"</plist>\n", AGENT_LABEL, installedFeedPath(), logPath(), logPath()];
+        [plist writeToFile:agentPlistPath() atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
+    return YES;
+}
+
+static void startAgent(void) {
+    if (feedRunning()) return;
+    if (!agentLoaded()) {
+        NSString *cmd = [NSString stringWithFormat:@"launchctl bootstrap gui/%@ %@ 2>&1; "
+                         @"launchctl enable gui/%@/%@ 2>/dev/null; true", uidString(), agentPlistPath(), uidString(), AGENT_LABEL];
+        runShell(cmd);
+    } else {
+        NSString *cmd = [NSString stringWithFormat:@"launchctl kickstart -k gui/%@/%@ 2>/dev/null; true", uidString(), AGENT_LABEL];
+        runShell(cmd);
+    }
+}
+
+static void stopAgent(void) {
+    NSString *cmd = [NSString stringWithFormat:@"launchctl bootout gui/%@/%@ 2>/dev/null; "
+                     @"pkill -x %@ 2>/dev/null; true", uidString(), AGENT_LABEL, FEED_NAME];
+    runShell(cmd);
 }
 
 @interface AppDelegate : NSObject <NSApplicationDelegate>
@@ -78,15 +142,22 @@ static void killFeed(void) {
 
     [menu addItem:[NSMenuItem separatorItem]];
 
-    NSMenuItem *quitItem = [[NSMenuItem alloc] initWithTitle:@"退出" action:@selector(quit:) keyEquivalent:@"q"];
+    NSMenuItem *quitItem = [[NSMenuItem alloc] initWithTitle:@"退出（驱动保持后台常驻）" action:@selector(quitApp:) keyEquivalent:@"q"];
     quitItem.target = self;
     [menu addItem:quitItem];
 
     self.statusItem.menu = menu;
     [self refresh:nil];
 
-    // 启动即自动拉起驱动（双击即用）
-    if (!feedRunning()) [self startFeed];
+    // 首次启动：自动安装（拷贝驱动 + 注册 LaunchAgent）+ 拉起常驻
+    if (ensureInstalled()) {
+        startAgent();
+    } else {
+        NSAlert *a = [[NSAlert alloc] init];
+        a.messageText = @"安装失败";
+        a.informativeText = @"无法拷贝驱动文件，请重新下载 App。";
+        [a runModal];
+    }
 
     self.timer = [NSTimer scheduledTimerWithTimeInterval:2.0 target:self selector:@selector(refresh:) userInfo:nil repeats:YES];
 }
@@ -109,66 +180,21 @@ static void killFeed(void) {
     self.statusItem.button.title = running ? @"🎥●" : @"🎥○";
 }
 
-- (void)startFeed {
-    NSString *feed = feedPath();
-    if (![[NSFileManager defaultManager] fileExistsAtPath:feed]) {
-        NSAlert *a = [[NSAlert alloc] init];
-        a.messageText = @"未找到 ps3eye-feed";
-        a.informativeText = @"App 包内缺少驱动可执行文件，请重新下载。";
-        [a runModal];
-        return;
-    }
-    self.starting = YES;
-    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:logPath()];
-    if (!fh) {
-        [[NSFileManager defaultManager] createFileAtPath:logPath() contents:nil attributes:nil];
-        fh = [NSFileHandle fileHandleForWritingAtPath:logPath()];
-    }
-    [fh seekToEndOfFile];
-
-    NSTask *t = [[NSTask alloc] init];
-    t.executableURL = [NSURL fileURLWithPath:feed];
-    t.standardOutput = fh;
-    t.standardError = fh;
-    __weak typeof(self) weakSelf = self;
-    t.terminationHandler = ^(NSTask *task) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            weakSelf.starting = NO;
-            [weakSelf refresh:nil];
-        });
-    };
-    @try {
-        [t launch];
-    } @catch (NSException *e) {
-        self.starting = NO;
-        NSAlert *a = [[NSAlert alloc] init];
-        a.messageText = @"启动失败";
-        a.informativeText = e.reason;
-        [a runModal];
-    }
-    [self refresh:nil];
-}
-
 - (void)toggleFeed:(id)sender {
     if (feedRunning()) {
-        killFeed();
+        stopAgent();
     } else {
-        [self startFeed];
+        startAgent();
     }
     [self refresh:nil];
 }
 
 - (void)openLog:(id)sender {
-    [[NSWorkspace sharedWorkspace] openFile:logPath()];
+    [[NSWorkspace sharedWorkspace] openURL:[NSURL fileURLWithPath:logPath()]];
 }
 
-- (void)applicationWillTerminate:(NSNotification *)notification {
-    // 兜底：任何退出路径（菜单/⌘Q/osascript/系统关机）都清理驱动进程
-    killFeed();
-}
-
-- (void)quit:(id)sender {
-    killFeed(); // 退出时清理驱动进程，避免孤儿
+// 退出只退出 App，驱动由 LaunchAgent 继续常驻
+- (void)quitApp:(id)sender {
     [[NSApplication sharedApplication] terminate:nil];
 }
 

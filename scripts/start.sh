@@ -6,6 +6,13 @@
 set -e
 cd "$(dirname "$0")/.."
 
+# 若已安装 LaunchAgent 常驻，直接走系统服务（推荐方式）
+if launchctl print "gui/$(id -u)/com.bh2voq.ps3eye-vcam" >/dev/null 2>&1; then
+    echo "ℹ️  已通过 LaunchAgent 常驻运行（开机自启，推荐）。"
+    echo "   菜单栏 App（PS3Eye-VirtualCam.app）或 ./scripts/uninstall-agent.sh 可停止。"
+    exit 0
+fi
+
 # 已在运行则提示退出
 if pgrep -f "ps3eye-feed$" > /dev/null; then
     echo "⚠️  ps3eye-feed 已在运行（PID $(pgrep -f 'ps3eye-feed$')），先执行 stop.sh"

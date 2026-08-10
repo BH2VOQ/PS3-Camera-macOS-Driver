@@ -31,8 +31,21 @@ PS3 Eye（索尼 PlayStation 3 摄像头）是性价比极高的 USB 摄像头�
 - 🎥 **系统级虚拟摄像头**：基于 OBS mac-virtualcam 扩展，所有 App 可见
 - 🔌 **即插即用**：无需付费开发者账号、无需关闭 SIP、无需内核驱动
 - 🔋 **无消费者自动熄灭**：没有 App 在用时 LED 自动熄灭、停止供帧；有 App 打开时立即恢复
+- 🔄 **后台常驻**：LaunchAgent 开机自启、崩溃自动拉起；菜单栏 App 退出不影响驱动
 - 🍎 **Apple Silicon 原生**：arm64 原生编译（静态链接 libusb，无 Homebrew 依赖）
 - 🛠 **纯命令行**：一键构建 + 一键启停，无 GUI 依赖
+
+## 🚀 安装（推荐：菜单栏 App）
+
+下载 [DMG](https://github.com/BH2VOQ/PS3Eye-VirtualCam/releases)，打开后把 `PS3Eye-VirtualCam.app` 拖入 Applications：
+
+1. 双击 App → **自动安装驱动**（拷贝到 `~/Library/Application Support/PS3Eye-VirtualCam/`，注册 LaunchAgent `com.bh2voq.ps3eye-vcam` 开机自启）
+2. 菜单栏出现 🎥 图标：显示状态（待机/推流中/未运行），可手动启停、打开日志
+3. 退出 App 不影响驱动——驱动由 LaunchAgent **常驻后台**，重启电脑后依然自动运行
+
+⚠️ 未签名 App 首次双击如被 Gatekeeper 拦截：右键 → 打开。
+
+CLI 方式：`./scripts/install-agent.sh`（常驻）或 `./scripts/start.sh`（前台）。
 
 ## 🚀 技术路线
 
@@ -151,6 +164,7 @@ The PlayStation 3 Eye is an excellent cheap USB camera (OV534 chipset, 640x480@6
 - 🎥 **System-wide virtual camera** based on the OBS mac-virtualcam extension
 - 🔌 **Plug & play**: no paid developer account, no SIP disable, no kernel driver
 - 🔋 **Auto-off when unused**: LED turns off and frame feeding stops when no app consumes the camera; resumes instantly on demand
+- 🔄 **Background resident**: LaunchAgent starts at login and auto-restarts on crash; quitting the menu-bar app does not stop the driver
 - 🍎 **Apple Silicon native**: arm64 build, statically-linked libusb (no Homebrew dependency)
 - 🛠 **CLI only**: one-command build + one-command start/stop
 
