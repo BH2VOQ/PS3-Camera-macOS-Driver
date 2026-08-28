@@ -42,10 +42,10 @@ class PS3EYECam
 public:
 	enum class EOutputFormat
 	{
-		Bayer,
-		BGR,
-		RGB,
-		Gray
+		Bayer,					// Output in Bayer. Destination buffer must be width * height bytes
+		BGR,					// Output in BGR. Destination buffer must be width * height * 3 bytes
+		RGB	,					// Output in RGB. Destination buffer must be width * height * 3 bytes
+		Gray					// Output in Grayscale. Destination buffer must be width * height bytes
 	};
 
 	typedef std::shared_ptr<PS3EYECam> PS3EYERef;
@@ -59,10 +59,7 @@ public:
 	bool init(uint32_t width = 0, uint32_t height = 0, uint16_t desiredFrameRate = 30, EOutputFormat outputFormat = EOutputFormat::BGR);
 	void start();
 	void stop();
-	void setLed(bool on);
-	// 仅暂停/恢复 OV534 数据输出，不取消 libusb URB，也不销毁 FrameQueue。
-	// 用于按需休眠：避免旧 stop()/start() 路径在 libusb callback 中发生同步自锁。
-	void setCaptureActive(bool active);
+	void setLed(bool on); // 仅控制 LED（纯寄存器写，安全；不启停传输流，避免 stop() 的 libusb 竞态崩溃）
 
 	// Controls
 
@@ -171,6 +168,9 @@ public:
 
 	bool getUSBPortPath(char *out_identifier, size_t max_identifier_length) const;
 	
+	// Get a frame from the camera. Notes:
+	// - If there is no frame available, this function will block until one is
+	// - The output buffer must be sized correctly, depending out the output format. See EOutputFormat.
 	void getFrame(uint8_t* frame);
 
 	uint32_t getWidth() const { return frame_width; }
@@ -184,6 +184,7 @@ public:
 	uint32_t getRowBytes() const { return frame_width * getOutputBytesPerPixel(); }
 	uint32_t getOutputBytesPerPixel() const;
 
+	//
 	static const std::vector<PS3EYERef>& getDevices( bool forceRefresh = false );
 
 private:
@@ -192,6 +193,7 @@ private:
 
 	void release();
 
+	// usb ops
 	uint16_t ov534_set_frame_rate(uint16_t frame_rate, bool dry_run = false);
 	void ov534_set_led(int status);
 	void ov534_reg_write(uint16_t reg, uint8_t val);
@@ -202,17 +204,18 @@ private:
 	void reg_w_array(const uint8_t (*data)[2], int len);
 	void sccb_w_array(const uint8_t (*data)[2], int len);
 
+	// controls
 	bool autogain;
-	uint8_t gain;
-	uint8_t exposure;
-	uint8_t sharpness;
-	uint8_t hue;
+	uint8_t gain; // 0 <-> 63
+	uint8_t exposure; // 0 <-> 255
+	uint8_t sharpness; // 0 <-> 63
+	uint8_t hue; // 0 <-> 255
 	bool awb;
-	uint8_t brightness;
-	uint8_t contrast;
-	uint8_t blueblc;
-	uint8_t redblc;
-	uint8_t greenblc;
+	uint8_t brightness; // 0 <-> 255
+	uint8_t contrast; // 0 <-> 255
+	uint8_t blueblc; // 0 <-> 255
+	uint8_t redblc; // 0 <-> 255
+	uint8_t greenblc; // 0 <-> 255
     bool flip_h;
     bool flip_v;
 
