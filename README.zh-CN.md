@@ -1,10 +1,12 @@
-# 📷 PS3Eye-VirtualCam
+# 📷 PS3 Camera macOS Driver
 
 [English](README.md) | **简体中文**
 
-在 Apple Silicon Mac 上把 PlayStation 3 Eye 变成系统级虚拟摄像头。
+在 Apple Silicon Mac 上把 PlayStation 3 Eye 变成系统级摄像头。
 
 本项目通过 `libusb + PS3EYEDriver + CoreMediaIO` 在用户态读取 PS3 Eye，并把视频帧送入 **OBS Virtual Camera**，供 QuickTime、浏览器、会议软件、直播软件等使用。
+
+> 项目英文名：**PS3 Camera macOS Driver**
 
 ## 工作原理
 
@@ -16,8 +18,8 @@ PS3EYEDriver
   │ 640×480 @ 30 fps
   ▼
 ps3eye-feed
+  │ BGR → NV12
   │ CoreMediaIO / CMSimpleQueue
-  │ NV12 视频帧
   ▼
 OBS Camera Extension
   ▼
@@ -31,22 +33,17 @@ OBS Virtual Camera
 
 `src/ps3eye-feed.mm` 是核心 feeder。它通过 PS3EYEDriver 和静态链接的 libusb 读取 PS3 Eye，当前使用 `640×480 @ 30 fps`，启用自动增益和自动白平衡，并把 BGR 图像转换成 NV12 后送入 CoreMediaIO。
 
-本项目复用 OBS 的 Camera Extension，而不是自行安装内核驱动或完整重写系统摄像头扩展。目标 App 最终只需要选择：
+目标软件只需要选择：
 
 ```text
 OBS Virtual Camera
 ```
 
-### 为什么现在使用手动开关
+### 为什么使用手动开关
 
-早期版本尝试过自动判断“是否有 App 正在使用虚拟摄像头”，包括：
+项目曾尝试通过 CMIO running 状态、AVFoundation 占用状态、sink queue 消费状态和周期性 stop/reopen 探测自动判断是否有 App 使用摄像头。
 
-- `kCMIODevicePropertyDeviceIsRunningSomewhere`
-- `AVCaptureDevice.inUseByAnotherApplication`
-- OBS sink queue 是否被消费
-- 周期性关闭/重新打开 sink 探测
-
-这些信号在 OBS Camera Extension 上都不够可靠，曾经实际造成约每 10 秒关闭一次然后迅速恢复的断流问题。
+这些方法在 OBS Camera Extension 上都不够可靠，实际曾导致大约每 10 秒自动关闭一次再迅速恢复。
 
 因此当前版本优先稳定性：
 
@@ -56,7 +53,7 @@ OBS Virtual Camera
 
 旧 PS3EYEDriver/libusb 的停止路径存在 transfer callback 自锁风险，因此当前实现避免在负载中频繁调用 `cam->stop()`。
 
-关闭摄像头时采用：
+关闭摄像头时：
 
 ```text
 菜单栏写入 OFF
@@ -72,8 +69,6 @@ LaunchAgent 自动重新拉起
 重新进入待机状态
 ```
 
-这样可以关闭物理摄像头，又避免高风险的 libusb stop 路径。
-
 ---
 
 # 使用教程
@@ -82,9 +77,9 @@ LaunchAgent 自动重新拉起
 
 需要：
 
-- Apple Silicon Mac（M1 / M2 / M3 / M4 等）
+- Apple Silicon Mac
 - macOS
-- PS3 Eye 摄像头
+- PS3 Eye
 - OBS Studio
 - 从源码构建时需要 Xcode Command Line Tools
 
@@ -118,6 +113,8 @@ cd PS3Eye-VirtualCam
 ~/Library/Logs/PS3Eye-VirtualCam/feed.log
 ```
 
+这些内部路径暂时保留旧名称，是为了兼容已经安装的版本。
+
 ## 3. 菜单栏 App
 
 菜单栏 App 默认使用英文，可在：
@@ -139,17 +136,9 @@ PS3 Eye: 待机（摄像头已关闭）
 退出菜单栏 App（后台保持待机）
 ```
 
-此时 PS3 Eye LED 应该熄灭，物理摄像头不持续采集，但后台 feeder 保持运行。
-
 ### 启用摄像头
 
-点击：
-
-```text
-启用摄像头
-```
-
-feeder 会打开 OBS Virtual Camera sink、启动 PS3 Eye、点亮 LED，并以 `640×480 @ 30 fps` 持续推流。
+点击 `启用摄像头` 后，feeder 会打开 OBS Virtual Camera sink、启动 PS3 Eye、点亮 LED，并以 `640×480 @ 30 fps` 持续推流。
 
 正常日志：
 
@@ -171,11 +160,7 @@ QuickTime Player
 
 ### 关闭摄像头
 
-使用结束后点击：
-
-```text
-关闭摄像头
-```
+使用结束后点击 `关闭摄像头`。
 
 日志会出现：
 
@@ -187,8 +172,6 @@ LED 熄灭，LaunchAgent 会重新拉起一个新的待机 feeder。
 
 ## 4. 更新项目
 
-推荐完整更新流程：
-
 ```bash
 cd ~/PS3Eye-VirtualCam
 git pull
@@ -197,9 +180,9 @@ git pull
 ./scripts/build-app.sh
 ```
 
-## 5. 查看日志
+## 5. 日志与排查
 
-实时查看：
+实时日志：
 
 ```bash
 tail -f "$HOME/Library/Logs/PS3Eye-VirtualCam/feed.log"
@@ -223,9 +206,7 @@ tail -n 50 "$HOME/Library/Logs/PS3Eye-VirtualCam/feed.log"
 pgrep -fl ps3eye-feed
 ```
 
-## 6. 常见问题
-
-### QuickTime 没有画面
+### QuickTime 没画面
 
 依次检查：
 
@@ -238,7 +219,7 @@ pgrep -fl ps3eye-feed
 
 ### `Bootstrap failed: 5: Input/output error`
 
-新版 `scripts/install-agent.sh` 已包含旧 LaunchAgent 状态清理逻辑。通常重新执行即可：
+重新执行：
 
 ```bash
 ./scripts/install-agent.sh
@@ -296,8 +277,6 @@ launchctl kickstart -k \
 ---
 
 # 当前设计取舍
-
-当前优先级：
 
 > **稳定性 > 全自动**
 
