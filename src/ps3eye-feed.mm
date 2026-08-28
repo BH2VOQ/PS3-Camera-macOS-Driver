@@ -1,8 +1,9 @@
 // ps3eye-feed.mm — PS3 Eye 抓帧 → OBS Virtual Camera sink
-// 设计目标：虚拟摄像头常驻可发现；仅当另一个 App 真正使用 OBS Virtual Camera 时启动物理 PS3 Eye。
+// 设计目标：待机时物理相机关闭；CMIO 检测到真实 source 客户端后启动，并在本次会话内保持稳定。
+// 注意：OBS Camera Extension 不向外部 feeder 暴露可靠的 source-client 关闭计数，
+// 因此绝不能用 AVFoundation inUseByAnotherApplication=false 作为关机依据，否则 QuickTime 会被周期性误杀。
 
 #import <Foundation/Foundation.h>
-#import <AVFoundation/AVFoundation.h>
 #import <CoreMediaIO/CMIOHardware.h>
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
@@ -19,8 +20,6 @@
 static const NSUInteger kWidth  = 640;
 static const NSUInteger kHeight = 480;
 static const double     kSendFPS = 30.0;
-static const int64_t    kIdleGraceNs = 5 * NSEC_PER_SEC;
-static const int64_t    kConsumerWarmupNs = 2 * NSEC_PER_SEC;
 static volatile sig_atomic_t g_running = 1;
 static void on_signal(int sig) { (void)sig; g_running = 0; }
 
@@ -109,9 +108,8 @@ static bool findSinkStream(CMIOObjectID *outDevice, CMIOStreamID *outSinkStream,
                                                      kCMIOObjectPropertyScopeGlobal,
                                                      kCMIOObjectPropertyElementMain};
                 UInt32 dirSize = sizeof(dir);
-                OSStatus drs = CMIOObjectGetPropertyData(streams[ti], &dirAddr, 0, NULL,
-                                                         dirSize, &dirSize, &dir);
-                (void)drs;
+                CMIOObjectGetPropertyData(streams[ti], &dirAddr, 0, NULL,
+                                          dirSize, &dirSize, &dir);
                 fprintf(stderr, "    stream[%u] id=%u direction=%u (%s)\n", ti, streams[ti], dir,
                         dir == 0 ? "OUT/source" : (dir == 1 ? "IN/sink" : "?"));
             }
@@ -139,27 +137,6 @@ static bool findSinkStream(CMIOObjectID *outDevice, CMIOStreamID *outSinkStream,
         }
     }
     return false;
-}
-
-static AVCaptureDevice *findOBSAVCaptureDevice() {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    NSArray<AVCaptureDevice *> *devices = [AVCaptureDevice devicesWithMediaType:AVMediaTypeVideo];
-#pragma clang diagnostic pop
-    for (AVCaptureDevice *captureDevice in devices) {
-        NSString *name = captureDevice.localizedName;
-        if ([name containsString:@"OBS Virtual Camera"]) return captureDevice;
-    }
-    return nil;
-}
-
-static bool isOBSConsumerActive(AVCaptureDevice *captureDevice) {
-    if (!captureDevice) return false;
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    BOOL active = captureDevice.inUseByAnotherApplication;
-#pragma clang diagnostic pop
-    return active == YES;
 }
 
 static void bgr_to_nv12(const uint8_t *bgr, uint8_t *yPlane, uint8_t *uvPlane,
@@ -218,13 +195,6 @@ int main(int argc, char *argv[]) {
             return 2;
         }
 
-        AVCaptureDevice *obsCaptureDevice = findOBSAVCaptureDevice();
-        if (!obsCaptureDevice) {
-            fprintf(stderr, "[ps3eye-feed] ERROR: OBS Virtual Camera is not visible through AVFoundation\n");
-            return 3;
-        }
-        fprintf(stderr, "[ps3eye-feed] consumer monitor ready: CMIO wake + AVFoundation close check\n");
-
         auto &devs = ps3eye::PS3EYECam::getDevices();
         if (devs.empty()) { fprintf(stderr, "[ps3eye-feed] ERROR: no PS3 Eye\n"); return 4; }
         auto cam = devs[0];
@@ -238,8 +208,7 @@ int main(int argc, char *argv[]) {
         cam->setLed(false);
         fprintf(stderr, "[ps3eye-feed] PS3 Eye idle (sensor not streaming); waiting for CMIO consumer\n");
 
-        // feeder 自己此时没有 StartStream，因此 DeviceIsRunningSomewhere=true 可以作为真实 source
-        // 客户端的唤醒信号。QuickTime 打开“新建影片录制”并选中 OBS Virtual Camera 时应触发。
+        // feeder 自己此时没有 StartStream，因此 DeviceIsRunningSomewhere=true 可作为 source 客户端唤醒信号。
         while (g_running && !isCMIODeviceRunningSomewhere(device)) {
             usleep(100 * 1000);
         }
@@ -298,12 +267,11 @@ int main(int argc, char *argv[]) {
 
         cam->start();
         cam->setLed(true);
-        fprintf(stderr, "[ps3eye-feed] PS3 Eye streaming 640x480@30 (AEC/AGC/AWB enabled)\n");
+        fprintf(stderr, "[ps3eye-feed] PS3 Eye streaming 640x480@30 (stable session; false auto-idle disabled)\n");
 
         std::vector<uint8_t> bgr(kWidth * kHeight * 3);
         uint64_t frameCount = 0;
         int64_t startedNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-        int64_t consumerInactiveSinceNs = 0;
         std::atomic<int64_t> lastFrameNs(startedNs);
         std::atomic<bool> captureActive(true);
 
@@ -321,26 +289,14 @@ int main(int argc, char *argv[]) {
             }
         });
 
+        // OBS Camera Extension 的 sink 启动后，DeviceIsRunningSomewhere 会包含 feeder 自己；
+        // AVCaptureDevice.inUseByAnotherApplication 对 QuickTime + 虚拟设备又会误报 false。
+        // 因此在没有 extension 端 client-count 通道之前，本次活跃会话只允许显式停止/进程重启，
+        // 绝不再根据不可靠信号自动 _Exit()，避免每约 10 秒断流一次。
         while (g_running) {
             cam->getFrame(bgr.data());
             int64_t nowNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
             lastFrameNs.store(nowNs, std::memory_order_relaxed);
-
-            // 给 QuickTime/AVFoundation 两秒时间完成 source stream 建立；之后再用 AVFoundation
-            // 占用状态判断关闭。若系统对虚拟设备仍不报告该状态，日志会明确显示并进入休眠。
-            if (nowNs - startedNs >= kConsumerWarmupNs) {
-                if (isOBSConsumerActive(obsCaptureDevice)) {
-                    consumerInactiveSinceNs = 0;
-                } else if (consumerInactiveSinceNs == 0) {
-                    consumerInactiveSinceNs = nowNs;
-                    fprintf(stderr, "[ps3eye-feed] AVFoundation reports no consumer; idle grace started\n");
-                } else if (nowNs - consumerInactiveSinceNs > kIdleGraceNs) {
-                    fprintf(stderr, "[ps3eye-feed] no consumer for 5s; physical camera entering idle\n");
-                    cam->setLed(false);
-                    fflush(stderr);
-                    std::_Exit(0);
-                }
-            }
 
             if (queue && CMSimpleQueueGetFullness(queue) < 1.0 && enqueueFrame(bgr.data())) {
                 frameCount++;
