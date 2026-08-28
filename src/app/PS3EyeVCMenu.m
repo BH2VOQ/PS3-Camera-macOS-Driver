@@ -1,8 +1,8 @@
 // PS3EyeVCMenu.m — PS3 Eye 虚拟摄像头菜单栏控制 App
 // 架构：驱动通过 LaunchAgent（com.bh2voq.ps3eye-vcam）常驻后台——
 // 开机自启、崩溃自动拉起、退出 App 不影响驱动。App 只负责：
-//   首次启动自动安装（拷贝驱动到 Application Support + 注册 LaunchAgent）
-//   菜单栏状态显示（待机/推流中/未运行）、手动启停、打开日志
+//   首次启动/升级时安装最新 feeder + 注册 LaunchAgent
+//   菜单栏状态显示、手动启停、打开日志
 #import <Cocoa/Cocoa.h>
 
 #define AGENT_LABEL @"com.bh2voq.ps3eye-vcam"
@@ -57,37 +57,68 @@ static BOOL agentLoaded(void) {
     return runShell(cmd) == 0;
 }
 
-// 安装：拷贝驱动 + 写 LaunchAgent plist + bootstrap
+static void unloadAgentIfLoaded(void) {
+    if (!agentLoaded()) return;
+    NSString *cmd = [NSString stringWithFormat:@"launchctl bootout gui/%@/%@ 2>/dev/null; true", uidString(), AGENT_LABEL];
+    runShell(cmd);
+}
+
+// 安装/升级：保证 Application Support 中永远是 App 当前捆绑的 feeder，
+// 同时刷新 LaunchAgent。旧版只在文件不存在时复制，导致升级后仍长期运行旧二进制。
 static BOOL ensureInstalled(void) {
     NSFileManager *fm = [NSFileManager defaultManager];
     [fm createDirectoryAtPath:supportDir() withIntermediateDirectories:YES attributes:nil error:nil];
 
     NSString *bundled = [[NSBundle mainBundle] pathForResource:FEED_NAME ofType:nil];
-    if (bundled && ![fm fileExistsAtPath:installedFeedPath()]) {
-        [fm copyItemAtPath:bundled toPath:installedFeedPath() error:nil];
-    }
-    if (![fm fileExistsAtPath:installedFeedPath()]) return NO;
+    if (!bundled || ![fm fileExistsAtPath:bundled]) return NO;
 
-    if (![fm fileExistsAtPath:agentPlistPath()]) {
-        NSString *plist = [NSString stringWithFormat:
-            @"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-            @"<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
-            @"<plist version=\"1.0\">\n"
-            @"<dict>\n"
-            @"\t<key>Label</key><string>%@</string>\n"
-            @"\t<key>ProgramArguments</key>\n"
-            @"\t<array><string>%@</string></array>\n"
-            @"\t<key>RunAtLoad</key><true/>\n"
-            @"\t<key>KeepAlive</key><true/>\n"
-            @"\t<key>ThrottleInterval</key><integer>10</integer>\n"
-            @"\t<key>ProcessType</key><string>Background</string>\n"
-            @"\t<key>StandardOutPath</key><string>%@</string>\n"
-            @"\t<key>StandardErrorPath</key><string>%@</string>\n"
-            @"</dict>\n"
-            @"</plist>\n", AGENT_LABEL, installedFeedPath(), logPath(), logPath()];
-        [plist writeToFile:agentPlistPath() atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    BOOL feedChanged = ![fm fileExistsAtPath:installedFeedPath()] ||
+                       ![fm contentsEqualAtPath:bundled andPath:installedFeedPath()];
+
+    NSString *plist = [NSString stringWithFormat:
+        @"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        @"<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+        @"<plist version=\"1.0\">\n"
+        @"<dict>\n"
+        @"\t<key>Label</key><string>%@</string>\n"
+        @"\t<key>ProgramArguments</key>\n"
+        @"\t<array><string>%@</string></array>\n"
+        @"\t<key>RunAtLoad</key><true/>\n"
+        @"\t<key>KeepAlive</key><true/>\n"
+        @"\t<key>ThrottleInterval</key><integer>2</integer>\n"
+        @"\t<key>ProcessType</key><string>Background</string>\n"
+        @"\t<key>StandardOutPath</key><string>%@</string>\n"
+        @"\t<key>StandardErrorPath</key><string>%@</string>\n"
+        @"</dict>\n"
+        @"</plist>\n", AGENT_LABEL, installedFeedPath(), logPath(), logPath()];
+
+    NSString *existingPlist = [NSString stringWithContentsOfFile:agentPlistPath()
+                                                         encoding:NSUTF8StringEncoding
+                                                            error:nil];
+    BOOL plistChanged = !(existingPlist && [existingPlist isEqualToString:plist]);
+
+    // 若 feeder 或 plist 有变化，先卸载旧 job，确保随后 bootstrap 的一定是新二进制/新参数。
+    if (feedChanged || plistChanged) unloadAgentIfLoaded();
+
+    if (feedChanged) {
+        [fm removeItemAtPath:installedFeedPath() error:nil];
+        NSError *copyError = nil;
+        if (![fm copyItemAtPath:bundled toPath:installedFeedPath() error:&copyError]) {
+            NSLog(@"Failed to update feeder: %@", copyError);
+            return NO;
+        }
+        [fm setAttributes:@{NSFilePosixPermissions: @0755}
+             ofItemAtPath:installedFeedPath()
+                    error:nil];
     }
-    return YES;
+
+    if (plistChanged) {
+        if (![plist writeToFile:agentPlistPath() atomically:YES encoding:NSUTF8StringEncoding error:nil]) {
+            return NO;
+        }
+    }
+
+    return [fm fileExistsAtPath:installedFeedPath()];
 }
 
 static void startAgent(void) {
@@ -167,7 +198,7 @@ static void ensureAppAgent(void) {
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
-    // 单实例守护：bootstrap 自启可能再拉起一份 → 后到者退出
+    (void)notification;
     NSArray<NSRunningApplication *> *instances =
         [NSRunningApplication runningApplicationsWithBundleIdentifier:@"com.bh2voq.ps3eye-vcam"];
     if (instances.count > 1) {
@@ -199,14 +230,13 @@ static void ensureAppAgent(void) {
     self.statusItem.menu = menu;
     [self refresh:nil];
 
-    // 首次启动：自动安装（拷贝驱动 + 注册 LaunchAgent）+ 拉起常驻；注册 App 自身开机自启
     if (ensureInstalled()) {
         startAgent();
         ensureAppAgent();
     } else {
         NSAlert *a = [[NSAlert alloc] init];
         a.messageText = @"安装失败";
-        a.informativeText = @"无法拷贝驱动文件，请重新下载 App。";
+        a.informativeText = @"无法安装或更新驱动文件，请重新下载 App。";
         [a runModal];
     }
 
@@ -214,14 +244,14 @@ static void ensureAppAgent(void) {
 }
 
 - (void)refresh:(NSTimer *)t {
+    (void)t;
     BOOL running = feedRunning();
     NSString *state;
     if (running) {
         NSString *last = [self lastLogLine];
-        if ([last containsString:@"无消费者"]) state = @"待机中（LED 灭）";
-        else if ([last containsString:@"检测到消费者"] || [last containsString:@"消费者仍在"] ||
-                 [last containsString:@"frames sent"]) state = @"推流中（LED 亮）";
-        else state = @"运行中";
+        if ([last containsString:@"frames sent"]) state = @"推流中";
+        else if ([last containsString:@"FATAL"]) state = @"正在自动恢复";
+        else state = @"运行中（待命）";
         self.toggleItem.title = @"停止";
     } else {
         state = self.starting ? @"启动中…" : @"未运行";
@@ -232,6 +262,7 @@ static void ensureAppAgent(void) {
 }
 
 - (void)toggleFeed:(id)sender {
+    (void)sender;
     if (feedRunning()) {
         stopAgent();
     } else {
@@ -241,11 +272,13 @@ static void ensureAppAgent(void) {
 }
 
 - (void)openLog:(id)sender {
+    (void)sender;
     [[NSWorkspace sharedWorkspace] openURL:[NSURL fileURLWithPath:logPath()]];
 }
 
 // 退出只退出 App，驱动由 LaunchAgent 继续常驻
 - (void)quitApp:(id)sender {
+    (void)sender;
     [[NSApplication sharedApplication] terminate:nil];
 }
 
@@ -253,6 +286,7 @@ static void ensureAppAgent(void) {
 
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
+        (void)argc; (void)argv;
         NSApplication *app = [NSApplication sharedApplication];
         AppDelegate *delegate = [[AppDelegate alloc] init];
         app.delegate = delegate;
