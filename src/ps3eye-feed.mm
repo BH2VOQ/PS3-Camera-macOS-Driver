@@ -1,7 +1,6 @@
 // ps3eye-feed.mm — PS3 Eye 抓帧 → OBS Virtual Camera sink
-// 设计目标：待机时物理相机关闭；CMIO 检测到真实 source 客户端后启动，并在本次会话内保持稳定。
-// 注意：OBS Camera Extension 不向外部 feeder 暴露可靠的 source-client 关闭计数，
-// 因此绝不能用 AVFoundation inUseByAnotherApplication=false 作为关机依据，否则 QuickTime 会被周期性误杀。
+// 手动控制模式：LaunchAgent/feeder 常驻；物理 PS3 Eye 只有在 control 文件为 1 时启动。
+// 关闭时不调用旧驱动的 cam->stop()，而是灭 LED 后 _Exit()，由 LaunchAgent 拉回待机进程。
 
 #import <Foundation/Foundation.h>
 #import <CoreMediaIO/CMIOHardware.h>
@@ -22,6 +21,19 @@ static const NSUInteger kHeight = 480;
 static const double     kSendFPS = 30.0;
 static volatile sig_atomic_t g_running = 1;
 static void on_signal(int sig) { (void)sig; g_running = 0; }
+
+static NSString *controlPath() {
+    return [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/PS3Eye-VirtualCam/enabled"];
+}
+
+static bool manualEnabled() {
+    NSString *value = [NSString stringWithContentsOfFile:controlPath()
+                                                    encoding:NSUTF8StringEncoding
+                                                       error:nil];
+    if (!value) return false;
+    value = [value stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    return [value isEqualToString:@"1"] || [value caseInsensitiveCompare:@"true"] == NSOrderedSame || [value caseInsensitiveCompare:@"on"] == NSOrderedSame;
+}
 
 static bool acquireSingleInstanceLock() {
     static int lockfd = -1;
@@ -47,17 +59,6 @@ static UInt32 getCMIOPropertyDataSize(CMIOObjectID obj, CMIOObjectPropertySelect
     UInt32 size = 0;
     CMIOObjectGetPropertyDataSize(obj, &addr, 0, NULL, &size);
     return size;
-}
-
-static bool isCMIODeviceRunningSomewhere(CMIOObjectID device) {
-    UInt32 running = 0;
-    UInt32 size = sizeof(running);
-    OSStatus status = getCMIOProperty(device,
-                                      kCMIODevicePropertyDeviceIsRunningSomewhere,
-                                      kCMIOObjectPropertyScopeGlobal,
-                                      kCMIOObjectPropertyElementMain,
-                                      &running, &size);
-    return status == noErr && running != 0;
 }
 
 static bool findSinkStream(CMIOObjectID *outDevice, CMIOStreamID *outSinkStream,
@@ -150,9 +151,10 @@ static void bgr_to_nv12(const uint8_t *bgr, uint8_t *yPlane, uint8_t *uvPlane,
             int Y = (66 * R + 129 * G + 25 * B + 128) >> 8;
             int Cb = (-38 * R - 74 * G + 112 * B + 128) >> 8;
             int Cr = (112 * R - 94 * G - 18 * B + 128) >> 8;
-            Y  += 16;  if (Y < 16) Y = 16; if (Y > 235) Y = 235;
-            Cb += 128; if (Cb < 16) Cb = 16; if (Cb > 240) Cb = 240;
-            Cr += 128; if (Cr < 16) Cr = 16; if (Cr > 240) Cr = 240;
+            Y += 16; Cb += 128; Cr += 128;
+            if (Y < 16) Y = 16; if (Y > 235) Y = 235;
+            if (Cb < 16) Cb = 16; if (Cb > 240) Cb = 240;
+            if (Cr < 16) Cr = 16; if (Cr > 240) Cr = 240;
             yPlane[y * yStride + x] = (uint8_t)Y;
             if (y + 1 < h) {
                 const uint8_t *p2 = bgr + ((y + 1) * w + x) * 3;
@@ -182,7 +184,7 @@ static void bgr_to_nv12(const uint8_t *bgr, uint8_t *yPlane, uint8_t *uvPlane,
 int main(int argc, char *argv[]) {
     @autoreleasepool {
         (void)argc; (void)argv;
-        fprintf(stderr, "[ps3eye-feed] starting\n");
+        fprintf(stderr, "[ps3eye-feed] starting (manual control mode)\n");
         if (!acquireSingleInstanceLock()) return 1;
         signal(SIGINT, on_signal);
         signal(SIGTERM, on_signal);
@@ -206,14 +208,13 @@ int main(int argc, char *argv[]) {
         cam->setAutoWhiteBalance(true);
         cam->setBrightness(24);
         cam->setLed(false);
-        fprintf(stderr, "[ps3eye-feed] PS3 Eye idle (sensor not streaming); waiting for CMIO consumer\n");
+        fprintf(stderr, "[ps3eye-feed] PS3 Eye standby; manual switch is OFF\n");
 
-        // feeder 自己此时没有 StartStream，因此 DeviceIsRunningSomewhere=true 可作为 source 客户端唤醒信号。
-        while (g_running && !isCMIODeviceRunningSomewhere(device)) {
+        while (g_running && !manualEnabled()) {
             usleep(100 * 1000);
         }
         if (!g_running) std::_Exit(0);
-        fprintf(stderr, "[ps3eye-feed] CMIO consumer detected; starting sink + physical camera\n");
+        fprintf(stderr, "[ps3eye-feed] manual switch ON; starting sink + physical camera\n");
 
         OSStatus qs = CMIOStreamCopyBufferQueue(sink,
                                                 [](CMIOStreamID, void *, void *) {},
@@ -267,7 +268,7 @@ int main(int argc, char *argv[]) {
 
         cam->start();
         cam->setLed(true);
-        fprintf(stderr, "[ps3eye-feed] PS3 Eye streaming 640x480@30 (stable session; false auto-idle disabled)\n");
+        fprintf(stderr, "[ps3eye-feed] PS3 Eye streaming 640x480@30 (manual ON)\n");
 
         std::vector<uint8_t> bgr(kWidth * kHeight * 3);
         uint64_t frameCount = 0;
@@ -289,14 +290,17 @@ int main(int argc, char *argv[]) {
             }
         });
 
-        // OBS Camera Extension 的 sink 启动后，DeviceIsRunningSomewhere 会包含 feeder 自己；
-        // AVCaptureDevice.inUseByAnotherApplication 对 QuickTime + 虚拟设备又会误报 false。
-        // 因此在没有 extension 端 client-count 通道之前，本次活跃会话只允许显式停止/进程重启，
-        // 绝不再根据不可靠信号自动 _Exit()，避免每约 10 秒断流一次。
         while (g_running) {
             cam->getFrame(bgr.data());
             int64_t nowNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
             lastFrameNs.store(nowNs, std::memory_order_relaxed);
+
+            if (!manualEnabled()) {
+                fprintf(stderr, "[ps3eye-feed] manual switch OFF; physical camera entering standby\n");
+                cam->setLed(false);
+                fflush(stderr);
+                std::_Exit(0);
+            }
 
             if (queue && CMSimpleQueueGetFullness(queue) < 1.0 && enqueueFrame(bgr.data())) {
                 frameCount++;
@@ -307,12 +311,7 @@ int main(int argc, char *argv[]) {
 
         captureActive.store(false, std::memory_order_relaxed);
         if (watchdog.joinable()) watchdog.join();
-        fprintf(stderr, "[ps3eye-feed] stopping...\n");
-        CMIODeviceStopStream(device, sink);
-        if (queue) CFRelease(queue);
         cam->setLed(false);
-        if (pool) CVPixelBufferPoolRelease(pool);
-        if (fmt) CFRelease(fmt);
         fflush(stderr);
         std::_Exit(0);
     }
