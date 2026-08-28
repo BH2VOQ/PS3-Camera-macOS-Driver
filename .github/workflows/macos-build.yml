@@ -20,3 +20,24 @@ jobs:
 
       - name: Build menu bar app
         run: ./scripts/build-app.sh
+
+      - name: Package v1.0.0 release
+        run: ./scripts/package-release.sh
+
+      - name: Verify release packages
+        run: |
+          test -f dist/release/PS3-Camera-macOS-Driver-v1.0.0.dmg
+          test -f dist/release/PS3-Camera-macOS-Driver-v1.0.0.zip
+          test -f dist/release/SHA256SUMS.txt
+          cat dist/release/SHA256SUMS.txt
+
+      - name: Upload release packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: PS3-Camera-macOS-Driver-v1.0.0
+          path: |
+            dist/release/PS3-Camera-macOS-Driver-v1.0.0.dmg
+            dist/release/PS3-Camera-macOS-Driver-v1.0.0.zip
+            dist/release/SHA256SUMS.txt
+          if-no-files-found: error
+          compression-level: 0
