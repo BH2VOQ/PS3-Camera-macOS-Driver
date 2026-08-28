@@ -1,10 +1,11 @@
-// PS3EyeVCMenu.m — PS3 Eye 虚拟摄像头菜单栏控制 App
-// LaunchAgent 常驻后台；菜单栏只控制物理 PS3 Eye 的手动启用/待机状态。
+// PS3EyeVCMenu.m — PS3 Eye virtual camera menu bar controller
+// LaunchAgent stays resident; menu bar controls the physical camera state.
 #import <Cocoa/Cocoa.h>
 
 #define AGENT_LABEL @"com.bh2voq.ps3eye-vcam"
 #define APP_AGENT_LABEL @"com.bh2voq.ps3eye-vcam-app"
-#define FEED_NAME  @"ps3eye-feed"
+#define FEED_NAME @"ps3eye-feed"
+#define LANG_KEY @"PS3EyeLanguage"
 
 static NSString *appAgentPlistPath(void) {
     return [NSHomeDirectory() stringByAppendingPathComponent:@"Library/LaunchAgents/com.bh2voq.ps3eye-vcam-app.plist"];
@@ -149,12 +150,24 @@ static void ensureAppAgent(void) {
 
 @interface AppDelegate : NSObject <NSApplicationDelegate>
 @property NSStatusItem *statusItem;
+@property NSMenu *menu;
 @property NSMenuItem *statusMenuItem;
 @property NSMenuItem *toggleItem;
+@property NSMenuItem *logItem;
+@property NSMenuItem *languageItem;
+@property NSMenuItem *englishItem;
+@property NSMenuItem *chineseItem;
+@property NSMenuItem *quitItem;
 @property NSTimer *timer;
 @end
 
 @implementation AppDelegate
+
+- (BOOL)isChinese {
+    NSString *lang = [[NSUserDefaults standardUserDefaults] stringForKey:LANG_KEY];
+    return [lang isEqualToString:@"zh"];
+}
+
 - (NSString *)lastLogLine {
     NSString *log = [NSString stringWithContentsOfFile:logPath() encoding:NSUTF8StringEncoding error:nil];
     if (!log) return @"";
@@ -166,50 +179,81 @@ static void ensureAppAgent(void) {
     return @"";
 }
 
+- (void)applyLanguage {
+    BOOL zh = [self isChinese];
+    self.logItem.title = zh ? @"打开日志" : @"Open Log";
+    self.languageItem.title = zh ? @"语言" : @"Language";
+    self.englishItem.title = @"English";
+    self.chineseItem.title = @"中文";
+    self.englishItem.state = zh ? NSControlStateValueOff : NSControlStateValueOn;
+    self.chineseItem.state = zh ? NSControlStateValueOn : NSControlStateValueOff;
+    self.quitItem.title = zh ? @"退出菜单栏 App（后台保持待机）" : @"Quit Menu Bar App (Background Stays Idle)";
+    [self refresh:nil];
+}
+
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
     (void)notification;
     NSArray<NSRunningApplication *> *instances = [NSRunningApplication runningApplicationsWithBundleIdentifier:@"com.bh2voq.ps3eye-vcam"];
     if (instances.count > 1) { [NSApp terminate:nil]; return; }
 
     self.statusItem = [[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength];
-    NSMenu *menu = [[NSMenu alloc] init];
-    self.statusMenuItem = [[NSMenuItem alloc] initWithTitle:@"PS3 Eye: …" action:nil keyEquivalent:@""];
+    self.menu = [[NSMenu alloc] init];
+
+    self.statusMenuItem = [[NSMenuItem alloc] initWithTitle:@"PS3 Eye: ..." action:nil keyEquivalent:@""];
     self.statusMenuItem.enabled = NO;
-    [menu addItem:self.statusMenuItem];
+    [self.menu addItem:self.statusMenuItem];
 
-    self.toggleItem = [[NSMenuItem alloc] initWithTitle:@"启用摄像头" action:@selector(toggleCamera:) keyEquivalent:@""];
+    self.toggleItem = [[NSMenuItem alloc] initWithTitle:@"Enable Camera" action:@selector(toggleCamera:) keyEquivalent:@""];
     self.toggleItem.target = self;
-    [menu addItem:self.toggleItem];
+    [self.menu addItem:self.toggleItem];
 
-    NSMenuItem *logItem = [[NSMenuItem alloc] initWithTitle:@"打开日志" action:@selector(openLog:) keyEquivalent:@""];
-    logItem.target = self;
-    [menu addItem:logItem];
-    [menu addItem:[NSMenuItem separatorItem]];
-    NSMenuItem *quitItem = [[NSMenuItem alloc] initWithTitle:@"退出菜单栏（后台保持待机）" action:@selector(quitApp:) keyEquivalent:@"q"];
-    quitItem.target = self;
-    [menu addItem:quitItem];
-    self.statusItem.menu = menu;
+    self.logItem = [[NSMenuItem alloc] initWithTitle:@"Open Log" action:@selector(openLog:) keyEquivalent:@""];
+    self.logItem.target = self;
+    [self.menu addItem:self.logItem];
+
+    NSMenu *languageMenu = [[NSMenu alloc] init];
+    self.englishItem = [[NSMenuItem alloc] initWithTitle:@"English" action:@selector(selectEnglish:) keyEquivalent:@""];
+    self.englishItem.target = self;
+    [languageMenu addItem:self.englishItem];
+    self.chineseItem = [[NSMenuItem alloc] initWithTitle:@"中文" action:@selector(selectChinese:) keyEquivalent:@""];
+    self.chineseItem.target = self;
+    [languageMenu addItem:self.chineseItem];
+
+    self.languageItem = [[NSMenuItem alloc] initWithTitle:@"Language" action:nil keyEquivalent:@""];
+    self.languageItem.submenu = languageMenu;
+    [self.menu addItem:self.languageItem];
+
+    [self.menu addItem:[NSMenuItem separatorItem]];
+
+    self.quitItem = [[NSMenuItem alloc] initWithTitle:@"Quit Menu Bar App (Background Stays Idle)" action:@selector(quitApp:) keyEquivalent:@"q"];
+    self.quitItem.target = self;
+    [self.menu addItem:self.quitItem];
+
+    self.statusItem.menu = self.menu;
 
     if (ensureInstalled()) {
         startAgent();
         ensureAppAgent();
     }
-    [self refresh:nil];
+
+    [self applyLanguage];
     self.timer = [NSTimer scheduledTimerWithTimeInterval:1.0 target:self selector:@selector(refresh:) userInfo:nil repeats:YES];
 }
 
 - (void)refresh:(NSTimer *)t {
     (void)t;
+    BOOL zh = [self isChinese];
     BOOL enabled = cameraEnabled();
     BOOL running = feedRunning();
     NSString *last = [self lastLogLine];
     NSString *state;
-    if (!running) state = @"后台未运行";
-    else if (!enabled) state = @"待机（已关闭）";
-    else if ([last containsString:@"frames sent"] || [last containsString:@"streaming"]) state = @"推流中";
-    else state = @"启动中…";
 
-    self.toggleItem.title = enabled ? @"关闭摄像头" : @"启用摄像头";
+    if (!running) state = zh ? @"后台未运行" : @"Background Not Running";
+    else if (!enabled) state = zh ? @"待机（摄像头已关闭）" : @"Standby (Camera Off)";
+    else if ([last containsString:@"frames sent"] || [last containsString:@"streaming"]) state = zh ? @"推流中" : @"Streaming";
+    else state = zh ? @"启动中…" : @"Starting...";
+
+    self.toggleItem.title = enabled ? (zh ? @"关闭摄像头" : @"Disable Camera") : (zh ? @"启用摄像头" : @"Enable Camera");
     self.statusMenuItem.title = [NSString stringWithFormat:@"PS3 Eye: %@", state];
     self.statusItem.button.title = enabled ? @"🎥●" : @"🎥○";
 }
@@ -222,10 +266,23 @@ static void ensureAppAgent(void) {
     [self refresh:nil];
 }
 
+- (void)selectEnglish:(id)sender {
+    (void)sender;
+    [[NSUserDefaults standardUserDefaults] setObject:@"en" forKey:LANG_KEY];
+    [self applyLanguage];
+}
+
+- (void)selectChinese:(id)sender {
+    (void)sender;
+    [[NSUserDefaults standardUserDefaults] setObject:@"zh" forKey:LANG_KEY];
+    [self applyLanguage];
+}
+
 - (void)openLog:(id)sender {
     (void)sender;
     [[NSWorkspace sharedWorkspace] openURL:[NSURL fileURLWithPath:logPath()]];
 }
+
 - (void)quitApp:(id)sender {
     (void)sender;
     [[NSApplication sharedApplication] terminate:nil];
