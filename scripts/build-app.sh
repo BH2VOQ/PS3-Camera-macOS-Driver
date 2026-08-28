@@ -6,10 +6,11 @@ cd "$(dirname "$0")/.."
 
 APP="dist/PS3-Camera-macOS-Driver.app"
 EXECUTABLE="PS3-Camera-macOS-Driver"
+VERSION="1.0.0"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
-echo "🔧 Building menu bar app..."
+echo "🔧 Building PS3 Camera macOS Driver v$VERSION..."
 clang -fobjc-arc -O2 -framework Cocoa -o "$APP/Contents/MacOS/$EXECUTABLE" src/app/PS3EyeVCMenu.m
 
 echo "📦 Bundling feeder..."
@@ -29,9 +30,9 @@ cat > "$APP/Contents/Info.plist" << PLIST
 	<key>CFBundleDisplayName</key>
 	<string>PS3 Camera macOS Driver</string>
 	<key>CFBundleVersion</key>
-	<string>0.1.2</string>
+	<string>$VERSION</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.1.2-beta</string>
+	<string>$VERSION</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>LSMinimumSystemVersion</key>
@@ -49,9 +50,11 @@ cat > "$APP/Contents/Info.plist" << PLIST
 PLIST
 
 echo "✍️  Applying ad-hoc signature..."
-codesign --force --deep -s - "$APP" 2>/dev/null || true
+codesign --force --deep -s - "$APP"
+codesign --verify --deep --strict "$APP"
 
 echo ""
 echo "✅ Build complete: $APP"
+echo "   Version: $VERSION"
 echo "   Copy it to /Applications and launch it to control the camera from the menu bar."
-echo "   If Gatekeeper blocks the unsigned app on first launch, right-click it and choose Open."
+echo "   If Gatekeeper blocks the ad-hoc signed app on first launch, right-click it and choose Open."
