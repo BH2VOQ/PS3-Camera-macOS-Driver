@@ -62,7 +62,8 @@ static BOOL cameraEnabled(void) {
 }
 static void setCameraEnabled(BOOL enabled) {
     [[NSFileManager defaultManager] createDirectoryAtPath:supportDir() withIntermediateDirectories:YES attributes:nil error:nil];
-    [enabled ? @"1\n" : @"0\n" writeToFile:controlPath() atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    NSString *value = enabled ? @"1\n" : @"0\n";
+    [value writeToFile:controlPath() atomically:YES encoding:NSUTF8StringEncoding error:nil];
 }
 
 static BOOL ensureInstalled(void) {
