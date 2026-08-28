@@ -20,6 +20,7 @@ static const NSUInteger kWidth  = 640;
 static const NSUInteger kHeight = 480;
 static const double     kSendFPS = 30.0;
 static const int64_t    kIdleGraceNs = 5 * NSEC_PER_SEC;
+static const int64_t    kConsumerWarmupNs = 2 * NSEC_PER_SEC;
 static volatile sig_atomic_t g_running = 1;
 static void on_signal(int sig) { (void)sig; g_running = 0; }
 
@@ -47,6 +48,17 @@ static UInt32 getCMIOPropertyDataSize(CMIOObjectID obj, CMIOObjectPropertySelect
     UInt32 size = 0;
     CMIOObjectGetPropertyDataSize(obj, &addr, 0, NULL, &size);
     return size;
+}
+
+static bool isCMIODeviceRunningSomewhere(CMIOObjectID device) {
+    UInt32 running = 0;
+    UInt32 size = sizeof(running);
+    OSStatus status = getCMIOProperty(device,
+                                      kCMIODevicePropertyDeviceIsRunningSomewhere,
+                                      kCMIOObjectPropertyScopeGlobal,
+                                      kCMIOObjectPropertyElementMain,
+                                      &running, &size);
+    return status == noErr && running != 0;
 }
 
 static bool findSinkStream(CMIOObjectID *outDevice, CMIOStreamID *outSinkStream,
@@ -136,9 +148,7 @@ static AVCaptureDevice *findOBSAVCaptureDevice() {
 #pragma clang diagnostic pop
     for (AVCaptureDevice *captureDevice in devices) {
         NSString *name = captureDevice.localizedName;
-        if ([name containsString:@"OBS Virtual Camera"]) {
-            return captureDevice;
-        }
+        if ([name containsString:@"OBS Virtual Camera"]) return captureDevice;
     }
     return nil;
 }
@@ -163,30 +173,30 @@ static void bgr_to_nv12(const uint8_t *bgr, uint8_t *yPlane, uint8_t *uvPlane,
             int Y = (66 * R + 129 * G + 25 * B + 128) >> 8;
             int Cb = (-38 * R - 74 * G + 112 * B + 128) >> 8;
             int Cr = (112 * R - 94 * G - 18 * B + 128) >> 8;
-            Y  = Y  + 16;  if (Y  < 16) Y  = 16;  if (Y  > 235) Y  = 235;
-            Cb = Cb + 128; if (Cb < 16) Cb = 16;  if (Cb > 240) Cb = 240;
-            Cr = Cr + 128; if (Cr < 16) Cr = 16;  if (Cr > 240) Cr = 240;
+            Y  += 16;  if (Y < 16) Y = 16; if (Y > 235) Y = 235;
+            Cb += 128; if (Cb < 16) Cb = 16; if (Cb > 240) Cb = 240;
+            Cr += 128; if (Cr < 16) Cr = 16; if (Cr > 240) Cr = 240;
             yPlane[y * yStride + x] = (uint8_t)Y;
             if (y + 1 < h) {
                 const uint8_t *p2 = bgr + ((y + 1) * w + x) * 3;
-                int Y2 = (66 * p2[2] + 129 * p2[1] + 25 * p2[0] + 128) >> 8;
-                Y2 = Y2 + 16; if (Y2 < 16) Y2 = 16; if (Y2 > 235) Y2 = 235;
+                int Y2 = ((66 * p2[2] + 129 * p2[1] + 25 * p2[0] + 128) >> 8) + 16;
+                if (Y2 < 16) Y2 = 16; if (Y2 > 235) Y2 = 235;
                 yPlane[(y + 1) * yStride + x] = (uint8_t)Y2;
             }
             if (x + 1 < w) {
                 const uint8_t *p3 = bgr + (y * w + x + 1) * 3;
-                int Y3 = (66 * p3[2] + 129 * p3[1] + 25 * p3[0] + 128) >> 8;
-                Y3 = Y3 + 16; if (Y3 < 16) Y3 = 16; if (Y3 > 235) Y3 = 235;
+                int Y3 = ((66 * p3[2] + 129 * p3[1] + 25 * p3[0] + 128) >> 8) + 16;
+                if (Y3 < 16) Y3 = 16; if (Y3 > 235) Y3 = 235;
                 yPlane[y * yStride + x + 1] = (uint8_t)Y3;
             }
             if (y + 1 < h && x + 1 < w) {
                 const uint8_t *p4 = bgr + ((y + 1) * w + x + 1) * 3;
-                int Y4 = (66 * p4[2] + 129 * p4[1] + 25 * p4[0] + 128) >> 8;
-                Y4 = Y4 + 16; if (Y4 < 16) Y4 = 16; if (Y4 > 235) Y4 = 235;
+                int Y4 = ((66 * p4[2] + 129 * p4[1] + 25 * p4[0] + 128) >> 8) + 16;
+                if (Y4 < 16) Y4 = 16; if (Y4 > 235) Y4 = 235;
                 yPlane[(y + 1) * yStride + x + 1] = (uint8_t)Y4;
             }
             size_t uvIdx = (y / 2) * uvStride + x;
-            uvPlane[uvIdx + 0] = (uint8_t)Cb;
+            uvPlane[uvIdx] = (uint8_t)Cb;
             uvPlane[uvIdx + 1] = (uint8_t)Cr;
         }
     }
@@ -196,7 +206,6 @@ int main(int argc, char *argv[]) {
     @autoreleasepool {
         (void)argc; (void)argv;
         fprintf(stderr, "[ps3eye-feed] starting\n");
-
         if (!acquireSingleInstanceLock()) return 1;
         signal(SIGINT, on_signal);
         signal(SIGTERM, on_signal);
@@ -214,8 +223,7 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "[ps3eye-feed] ERROR: OBS Virtual Camera is not visible through AVFoundation\n");
             return 3;
         }
-        fprintf(stderr, "[ps3eye-feed] AVFoundation consumer monitor ready: %s\n",
-                obsCaptureDevice.localizedName.UTF8String);
+        fprintf(stderr, "[ps3eye-feed] consumer monitor ready: CMIO wake + AVFoundation close check\n");
 
         auto &devs = ps3eye::PS3EYECam::getDevices();
         if (devs.empty()) { fprintf(stderr, "[ps3eye-feed] ERROR: no PS3 Eye\n"); return 4; }
@@ -228,15 +236,15 @@ int main(int argc, char *argv[]) {
         cam->setAutoWhiteBalance(true);
         cam->setBrightness(24);
         cam->setLed(false);
-        fprintf(stderr, "[ps3eye-feed] PS3 Eye idle (sensor not streaming); waiting for real consumer\n");
+        fprintf(stderr, "[ps3eye-feed] PS3 Eye idle (sensor not streaming); waiting for CMIO consumer\n");
 
-        // 不启动 sink、不启动物理相机。AVCaptureDevice.inUseByAnotherApplication 只负责判断
-        // 是否有别的 App 真正在使用 OBS Virtual Camera，避免把 OBS 扩展自身的 sink 消费误判成消费者。
-        while (g_running && !isOBSConsumerActive(obsCaptureDevice)) {
-            usleep(200 * 1000);
+        // feeder 自己此时没有 StartStream，因此 DeviceIsRunningSomewhere=true 可以作为真实 source
+        // 客户端的唤醒信号。QuickTime 打开“新建影片录制”并选中 OBS Virtual Camera 时应触发。
+        while (g_running && !isCMIODeviceRunningSomewhere(device)) {
+            usleep(100 * 1000);
         }
         if (!g_running) std::_Exit(0);
-        fprintf(stderr, "[ps3eye-feed] real consumer detected; starting sink + physical camera\n");
+        fprintf(stderr, "[ps3eye-feed] CMIO consumer detected; starting sink + physical camera\n");
 
         OSStatus qs = CMIOStreamCopyBufferQueue(sink,
                                                 [](CMIOStreamID, void *, void *) {},
@@ -249,7 +257,6 @@ int main(int argc, char *argv[]) {
         if (st != noErr) {
             fprintf(stderr, "[ps3eye-feed] ERROR: StartStream failed %d\n", st);
             CFRelease(queue);
-            queue = NULL;
             return 8;
         }
         fprintf(stderr, "[ps3eye-feed] sink stream started\n");
@@ -262,8 +269,7 @@ int main(int argc, char *argv[]) {
         };
         CVPixelBufferPoolRef pool = NULL;
         CVPixelBufferPoolCreate(kCFAllocatorDefault, NULL, (__bridge CFDictionaryRef)pbAttr, &pool);
-        if (!pool) { fprintf(stderr, "[ps3eye-feed] ERROR: pixel buffer pool\n"); return 6; }
-
+        if (!pool) return 6;
         CMVideoFormatDescriptionRef fmt = NULL;
         CMVideoFormatDescriptionCreate(kCFAllocatorDefault, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
                                        kWidth, kHeight, NULL, &fmt);
@@ -272,17 +278,15 @@ int main(int argc, char *argv[]) {
         auto enqueueFrame = [&](const uint8_t *bgr) -> bool {
             if (!queue || CMSimpleQueueGetFullness(queue) >= 1.0) return false;
             CVPixelBufferRef pb = NULL;
-            CVReturn cv = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &pb);
-            if (cv != kCVReturnSuccess || !pb) return false;
+            if (CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &pb) != kCVReturnSuccess || !pb) return false;
             CVPixelBufferLockBaseAddress(pb, 0);
-            uint8_t *yPlane  = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 0);
-            uint8_t *uvPlane = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 1);
-            bgr_to_nv12(bgr, yPlane, uvPlane, kWidth, kHeight);
+            bgr_to_nv12(bgr,
+                        (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 0),
+                        (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 1),
+                        kWidth, kHeight);
             CVPixelBufferUnlockBaseAddress(pb, 0);
-
             int64_t nowNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-            CMTime pts = CMTimeMake(nowNs, NSEC_PER_SEC);
-            CMSampleTimingInfo timing = {duration, pts, kCMTimeInvalid};
+            CMSampleTimingInfo timing = {duration, CMTimeMake(nowNs, NSEC_PER_SEC), kCMTimeInvalid};
             CMSampleBufferRef sb = NULL;
             OSStatus ss = CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, pb, true, NULL, NULL,
                                                              fmt, &timing, &sb);
@@ -298,9 +302,9 @@ int main(int argc, char *argv[]) {
 
         std::vector<uint8_t> bgr(kWidth * kHeight * 3);
         uint64_t frameCount = 0;
+        int64_t startedNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         int64_t consumerInactiveSinceNs = 0;
-        int64_t nowNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-        std::atomic<int64_t> lastFrameNs(nowNs);
+        std::atomic<int64_t> lastFrameNs(startedNs);
         std::atomic<bool> captureActive(true);
 
         std::thread watchdog([&lastFrameNs, &captureActive]() {
@@ -319,22 +323,23 @@ int main(int argc, char *argv[]) {
 
         while (g_running) {
             cam->getFrame(bgr.data());
-            nowNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+            int64_t nowNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
             lastFrameNs.store(nowNs, std::memory_order_relaxed);
 
-            if (isOBSConsumerActive(obsCaptureDevice)) {
-                consumerInactiveSinceNs = 0;
-            } else if (consumerInactiveSinceNs == 0) {
-                consumerInactiveSinceNs = nowNs;
-                fprintf(stderr, "[ps3eye-feed] consumer closed; idle grace started\n");
-            } else if (nowNs - consumerInactiveSinceNs > kIdleGraceNs) {
-                // 不调用 cam->stop()：旧 PS3EYEDriver 的 stop() 会 cancel URB 并可能在 libusb
-                // callback 线程里自锁。先灭 LED，再 _Exit() 跳过 C++ 析构，让 macOS 回收 USB handle。
-                // LaunchAgent 重新拉起后会回到上面的纯待机状态。
-                fprintf(stderr, "[ps3eye-feed] no real consumer for 5s; physical camera entering idle\n");
-                cam->setLed(false);
-                fflush(stderr);
-                std::_Exit(0);
+            // 给 QuickTime/AVFoundation 两秒时间完成 source stream 建立；之后再用 AVFoundation
+            // 占用状态判断关闭。若系统对虚拟设备仍不报告该状态，日志会明确显示并进入休眠。
+            if (nowNs - startedNs >= kConsumerWarmupNs) {
+                if (isOBSConsumerActive(obsCaptureDevice)) {
+                    consumerInactiveSinceNs = 0;
+                } else if (consumerInactiveSinceNs == 0) {
+                    consumerInactiveSinceNs = nowNs;
+                    fprintf(stderr, "[ps3eye-feed] AVFoundation reports no consumer; idle grace started\n");
+                } else if (nowNs - consumerInactiveSinceNs > kIdleGraceNs) {
+                    fprintf(stderr, "[ps3eye-feed] no consumer for 5s; physical camera entering idle\n");
+                    cam->setLed(false);
+                    fflush(stderr);
+                    std::_Exit(0);
+                }
             }
 
             if (queue && CMSimpleQueueGetFullness(queue) < 1.0 && enqueueFrame(bgr.data())) {
@@ -346,15 +351,13 @@ int main(int argc, char *argv[]) {
 
         captureActive.store(false, std::memory_order_relaxed);
         if (watchdog.joinable()) watchdog.join();
-
         fprintf(stderr, "[ps3eye-feed] stopping...\n");
         CMIODeviceStopStream(device, sink);
-        if (queue) { CFRelease(queue); queue = NULL; }
+        if (queue) CFRelease(queue);
         cam->setLed(false);
         if (pool) CVPixelBufferPoolRelease(pool);
         if (fmt) CFRelease(fmt);
-        fprintf(stderr, "[ps3eye-feed] cleaned up, bye\n");
         fflush(stderr);
-        std::_Exit(0); // 跳过 PS3EYECam 析构中的 stop()，规避旧 libusb cancel 自锁路径。
+        std::_Exit(0);
     }
 }
