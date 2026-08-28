@@ -24,7 +24,7 @@ cat > "$PLIST" << EOF
 	<array><string>$SUPPORT/ps3eye-feed</string></array>
 	<key>RunAtLoad</key><true/>
 	<key>KeepAlive</key><true/>
-	<key>ThrottleInterval</key><integer>10</integer>
+	<key>ThrottleInterval</key><integer>2</integer>
 	<key>ProcessType</key><string>Background</string>
 	<key>StandardOutPath</key><string>$LOG</string>
 	<key>StandardErrorPath</key><string>$LOG</string>
@@ -32,7 +32,7 @@ cat > "$PLIST" << EOF
 </plist>
 EOF
 
-# 先卸载旧的再装新的（幂等）
+# 先卸载旧的再装新的（幂等），保证升级后立即运行新 feeder
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
 launchctl enable "gui/$(id -u)/$LABEL" 2>/dev/null || true
