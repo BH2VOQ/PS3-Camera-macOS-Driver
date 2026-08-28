@@ -1,6 +1,6 @@
 #!/bin/bash
 # build.sh — 构建 PS3Eye-VirtualCam（Apple Silicon / arm64 原生）
-# 产物：bin/ps3eye-feed（喂帧主程序，自带消费者检测，无需独立 watchdog 进程）
+# 产物：bin/ps3eye-feed（常驻 640x480@30 feeder，带卡帧 watchdog）
 set -e
 cd "$(dirname "$0")"
 
