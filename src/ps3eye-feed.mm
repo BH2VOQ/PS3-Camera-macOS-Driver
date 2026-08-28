@@ -1,5 +1,5 @@
 // ps3eye-feed.mm — PS3 Eye 抓帧 → OBS Virtual Camera sink
-// 设计目标：OBS sink 常驻；物理 PS3 Eye 仅在真正有消费者时启动。
+// 设计目标：虚拟摄像头常驻可发现；仅当另一个 App 真正使用 OBS Virtual Camera 时启动物理 PS3 Eye。
 
 #import <Foundation/Foundation.h>
 #import <AVFoundation/AVFoundation.h>
@@ -129,6 +129,29 @@ static bool findSinkStream(CMIOObjectID *outDevice, CMIOStreamID *outSinkStream,
     return false;
 }
 
+static AVCaptureDevice *findOBSAVCaptureDevice() {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    NSArray<AVCaptureDevice *> *devices = [AVCaptureDevice devicesWithMediaType:AVMediaTypeVideo];
+#pragma clang diagnostic pop
+    for (AVCaptureDevice *captureDevice in devices) {
+        NSString *name = captureDevice.localizedName;
+        if ([name containsString:@"OBS Virtual Camera"]) {
+            return captureDevice;
+        }
+    }
+    return nil;
+}
+
+static bool isOBSConsumerActive(AVCaptureDevice *captureDevice) {
+    if (!captureDevice) return false;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    BOOL active = captureDevice.inUseByAnotherApplication;
+#pragma clang diagnostic pop
+    return active == YES;
+}
+
 static void bgr_to_nv12(const uint8_t *bgr, uint8_t *yPlane, uint8_t *uvPlane,
                         size_t w, size_t h) {
     const size_t yStride = w;
@@ -186,6 +209,14 @@ int main(int argc, char *argv[]) {
             return 2;
         }
 
+        AVCaptureDevice *obsCaptureDevice = findOBSAVCaptureDevice();
+        if (!obsCaptureDevice) {
+            fprintf(stderr, "[ps3eye-feed] ERROR: OBS Virtual Camera is not visible through AVFoundation\n");
+            return 3;
+        }
+        fprintf(stderr, "[ps3eye-feed] AVFoundation consumer monitor ready: %s\n",
+                obsCaptureDevice.localizedName.UTF8String);
+
         auto &devs = ps3eye::PS3EYECam::getDevices();
         if (devs.empty()) { fprintf(stderr, "[ps3eye-feed] ERROR: no PS3 Eye\n"); return 4; }
         auto cam = devs[0];
@@ -197,7 +228,15 @@ int main(int argc, char *argv[]) {
         cam->setAutoWhiteBalance(true);
         cam->setBrightness(24);
         cam->setLed(false);
-        fprintf(stderr, "[ps3eye-feed] PS3 Eye idle (sensor not streaming)\n");
+        fprintf(stderr, "[ps3eye-feed] PS3 Eye idle (sensor not streaming); waiting for real consumer\n");
+
+        // 不启动 sink、不启动物理相机。AVCaptureDevice.inUseByAnotherApplication 只负责判断
+        // 是否有别的 App 真正在使用 OBS Virtual Camera，避免把 OBS 扩展自身的 sink 消费误判成消费者。
+        while (g_running && !isOBSConsumerActive(obsCaptureDevice)) {
+            usleep(200 * 1000);
+        }
+        if (!g_running) std::_Exit(0);
+        fprintf(stderr, "[ps3eye-feed] real consumer detected; starting sink + physical camera\n");
 
         OSStatus qs = CMIOStreamCopyBufferQueue(sink,
                                                 [](CMIOStreamID, void *, void *) {},
@@ -213,7 +252,7 @@ int main(int argc, char *argv[]) {
             queue = NULL;
             return 8;
         }
-        fprintf(stderr, "[ps3eye-feed] sink stream started (persistent idle probe)\n");
+        fprintf(stderr, "[ps3eye-feed] sink stream started\n");
 
         NSDictionary *pbAttr = @{
             (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
@@ -230,7 +269,7 @@ int main(int argc, char *argv[]) {
                                        kWidth, kHeight, NULL, &fmt);
         CMTime duration = CMTimeMake(1, (int32_t)kSendFPS);
 
-        auto enqueueFrame = [&](const uint8_t *bgr, bool blackFrame) -> bool {
+        auto enqueueFrame = [&](const uint8_t *bgr) -> bool {
             if (!queue || CMSimpleQueueGetFullness(queue) >= 1.0) return false;
             CVPixelBufferRef pb = NULL;
             CVReturn cv = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &pb);
@@ -238,14 +277,7 @@ int main(int argc, char *argv[]) {
             CVPixelBufferLockBaseAddress(pb, 0);
             uint8_t *yPlane  = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 0);
             uint8_t *uvPlane = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 1);
-            size_t yBytes = CVPixelBufferGetBytesPerRowOfPlane(pb, 0) * kHeight;
-            size_t uvBytes = CVPixelBufferGetBytesPerRowOfPlane(pb, 1) * (kHeight / 2);
-            if (blackFrame) {
-                memset(yPlane, 16, yBytes);
-                memset(uvPlane, 128, uvBytes);
-            } else {
-                bgr_to_nv12(bgr, yPlane, uvPlane, kWidth, kHeight);
-            }
+            bgr_to_nv12(bgr, yPlane, uvPlane, kWidth, kHeight);
             CVPixelBufferUnlockBaseAddress(pb, 0);
 
             int64_t nowNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
@@ -260,31 +292,15 @@ int main(int argc, char *argv[]) {
             return true;
         };
 
-        // IDLE：只往 OBS sink 放一张黑色探针帧。
-        // 没有消费者时 queue 会保持满；消费者一打开 source，这张帧会被取走，
-        // feeder 无需 StopStream/StartStream 就能知道“真的有人在用”。
-        bool probeQueued = false;
-        while (g_running) {
-            double fullness = CMSimpleQueueGetFullness(queue);
-            if (probeQueued && fullness < 1.0) {
-                fprintf(stderr, "[ps3eye-feed] consumer detected; starting physical camera\n");
-                break;
-            }
-            if (!probeQueued && fullness < 1.0) {
-                if (enqueueFrame(NULL, true)) probeQueued = true;
-            }
-            usleep(100 * 1000);
-        }
-        if (!g_running) return 0;
-
         cam->start();
         cam->setLed(true);
         fprintf(stderr, "[ps3eye-feed] PS3 Eye streaming 640x480@30 (AEC/AGC/AWB enabled)\n");
 
         std::vector<uint8_t> bgr(kWidth * kHeight * 3);
         uint64_t frameCount = 0;
-        int64_t lastConsumerDrainNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-        std::atomic<int64_t> lastFrameNs(lastConsumerDrainNs);
+        int64_t consumerInactiveSinceNs = 0;
+        int64_t nowNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        std::atomic<int64_t> lastFrameNs(nowNs);
         std::atomic<bool> captureActive(true);
 
         std::thread watchdog([&lastFrameNs, &captureActive]() {
@@ -303,24 +319,28 @@ int main(int argc, char *argv[]) {
 
         while (g_running) {
             cam->getFrame(bgr.data());
-            int64_t nowNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+            nowNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
             lastFrameNs.store(nowNs, std::memory_order_relaxed);
 
-            if (queue && CMSimpleQueueGetFullness(queue) < 1.0) {
-                if (enqueueFrame(bgr.data(), false)) {
-                    lastConsumerDrainNs = nowNs;
-                    frameCount++;
-                    if (frameCount % 30 == 0)
-                        fprintf(stderr, "[ps3eye-feed] %llu frames sent\n", (unsigned long long)frameCount);
-                }
-            } else if (nowNs - lastConsumerDrainNs > kIdleGraceNs) {
+            if (isOBSConsumerActive(obsCaptureDevice)) {
+                consumerInactiveSinceNs = 0;
+            } else if (consumerInactiveSinceNs == 0) {
+                consumerInactiveSinceNs = nowNs;
+                fprintf(stderr, "[ps3eye-feed] consumer closed; idle grace started\n");
+            } else if (nowNs - consumerInactiveSinceNs > kIdleGraceNs) {
                 // 不调用 cam->stop()：旧 PS3EYEDriver 的 stop() 会 cancel URB 并可能在 libusb
-                // callback 线程里自锁。这里先灭 LED，再 _Exit() 跳过 C++ 析构；macOS 回收 USB handle。
-                // LaunchAgent 2 秒后拉起新的待机 feeder，新的进程只 init，不 start 物理摄像头。
-                fprintf(stderr, "[ps3eye-feed] no consumer for 5s; physical camera entering idle\n");
+                // callback 线程里自锁。先灭 LED，再 _Exit() 跳过 C++ 析构，让 macOS 回收 USB handle。
+                // LaunchAgent 重新拉起后会回到上面的纯待机状态。
+                fprintf(stderr, "[ps3eye-feed] no real consumer for 5s; physical camera entering idle\n");
                 cam->setLed(false);
                 fflush(stderr);
                 std::_Exit(0);
+            }
+
+            if (queue && CMSimpleQueueGetFullness(queue) < 1.0 && enqueueFrame(bgr.data())) {
+                frameCount++;
+                if (frameCount % 30 == 0)
+                    fprintf(stderr, "[ps3eye-feed] %llu frames sent\n", (unsigned long long)frameCount);
             }
         }
 
@@ -334,6 +354,7 @@ int main(int argc, char *argv[]) {
         if (pool) CVPixelBufferPoolRelease(pool);
         if (fmt) CFRelease(fmt);
         fprintf(stderr, "[ps3eye-feed] cleaned up, bye\n");
+        fflush(stderr);
+        std::_Exit(0); // 跳过 PS3EYECam 析构中的 stop()，规避旧 libusb cancel 自锁路径。
     }
-    return 0;
 }
