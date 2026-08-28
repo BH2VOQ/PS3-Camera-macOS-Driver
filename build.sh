@@ -4,6 +4,8 @@
 set -e
 cd "$(dirname "$0")"
 
+mkdir -p bin
+
 echo "🔧 构建 PS3Eye-VirtualCam (arm64)..."
 
 # ps3eye-feed — 抓帧喂 OBS Virtual Camera（静态链接 libusb）
