@@ -1,0 +1,22 @@
+name: macOS Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build feeder
+        run: |
+          chmod +x build.sh scripts/*.sh
+          mkdir -p bin
+          ./build.sh
+
+      - name: Build menu bar app
+        run: ./scripts/build-app.sh
