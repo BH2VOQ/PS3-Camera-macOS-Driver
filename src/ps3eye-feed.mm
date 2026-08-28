@@ -14,13 +14,15 @@
 #include <vector>
 #include <cstdio>
 #include <cstdlib>
+#include <atomic>
+#include <thread>
 #include "ps3eye.h"
 
 static const NSUInteger kWidth  = 640;
 static const NSUInteger kHeight = 480;
 static const double     kSendFPS = 30.0; // OBS source 描述为 30fps；物理采集也固定 30fps
 static volatile sig_atomic_t g_running = 1;
-static void on_signal(int sig) { g_running = 0; }
+static void on_signal(int sig) { (void)sig; g_running = 0; }
 
 static bool acquireSingleInstanceLock() {
     static int lockfd = -1;
@@ -174,6 +176,7 @@ static void bgr_to_nv12(const uint8_t *bgr, uint8_t *yPlane, uint8_t *uvPlane,
 
 int main(int argc, char *argv[]) {
     @autoreleasepool {
+        (void)argc; (void)argv;
         fprintf(stderr, "[ps3eye-feed] starting\n");
 
         if (!acquireSingleInstanceLock()) return 1;
@@ -237,12 +240,28 @@ int main(int argc, char *argv[]) {
 
         std::vector<uint8_t> bgr(kWidth * kHeight * 3);
         CMTime duration = CMTimeMake(1, (int32_t)kSendFPS);
-        CMTime pts = kCMTimeInvalid;
         uint64_t frameCount = 0;
 
+        // PS3EYEDriver 的旧错误回调可能在 libusb event thread 内进入阻塞式 close_transfers()。
+        // 不在回调里再次做同步清理；由独立 watchdog 检测“没有新帧”并让 LaunchAgent 干净重启进程。
+        std::atomic<int64_t> lastFrameNs(clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
+        std::thread watchdog([&lastFrameNs]() {
+            const int64_t kStallNs = 3 * NSEC_PER_SEC;
+            while (g_running) {
+                usleep(500 * 1000);
+                int64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+                if (now - lastFrameNs.load(std::memory_order_relaxed) > kStallNs) {
+                    fprintf(stderr, "[ps3eye-feed] FATAL: no camera frame for 3s; exiting for LaunchAgent recovery\n");
+                    fflush(stderr);
+                    std::_Exit(20);
+                }
+            }
+        });
+
         while (g_running) {
+            cam->getFrame(bgr.data()); // blocks until physical frame (~30fps)
             int64_t nowNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-            cam->getFrame(bgr.data()); // physical capture is already 30fps
+            lastFrameNs.store(nowNs, std::memory_order_relaxed);
 
             // sink buffer queue size = 1；无消费者/消费者慢时直接丢帧，不重启 stream。
             if (!queue || CMSimpleQueueGetFullness(queue) >= 1.0) continue;
@@ -256,8 +275,8 @@ int main(int argc, char *argv[]) {
             bgr_to_nv12(bgr.data(), yPlane, uvPlane, kWidth, kHeight);
             CVPixelBufferUnlockBaseAddress(pb, 0);
 
-            if (CMTIME_IS_INVALID(pts))
-                pts = CMTimeMake(nowNs, NSEC_PER_SEC);
+            // 每个真正送出的 sample 都使用当前单调时钟，避免长时间无人消费后 PTS 落后数分钟。
+            CMTime pts = CMTimeMake(nowNs, NSEC_PER_SEC);
             CMSampleTimingInfo timing = {duration, pts, kCMTimeInvalid};
             CMSampleBufferRef sb = NULL;
             OSStatus ss = CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, pb, true, NULL, NULL,
@@ -270,8 +289,9 @@ int main(int argc, char *argv[]) {
                 if (frameCount % 30 == 0)
                     fprintf(stderr, "[ps3eye-feed] %llu frames sent\n", (unsigned long long)frameCount);
             }
-            pts = CMTimeAdd(pts, duration);
         }
+
+        if (watchdog.joinable()) watchdog.join();
 
         // 退出阶段仍不调用 cam->stop()；进程退出由 OS 回收 libusb 传输，避免旧驱动 stop 路径自锁。
         fprintf(stderr, "[ps3eye-feed] stopping...\n");
