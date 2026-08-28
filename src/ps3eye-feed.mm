@@ -1,7 +1,5 @@
-// ps3eye-feed.mm — 极简 OBS 替代：PS3 Eye 抓帧 → 喂给 OBS Virtual Camera system extension
-// 原理：OBS 的 macOS 虚拟摄像头（system extension）是常驻 daemon，
-//       我们作为 CMIO 客户端往它的 Sink 流塞 sample buffer 即可。
-// 前提：OBS 已安装且虚拟摄像头扩展已激活（装 OBS 后 Start Virtual Camera 一次）。
+// ps3eye-feed.mm — PS3 Eye 抓帧 → OBS Virtual Camera sink
+// 设计目标：OBS sink 常驻；物理 PS3 Eye 仅在真正有消费者时启动。
 
 #import <Foundation/Foundation.h>
 #import <AVFoundation/AVFoundation.h>
@@ -20,7 +18,8 @@
 
 static const NSUInteger kWidth  = 640;
 static const NSUInteger kHeight = 480;
-static const double     kSendFPS = 30.0; // OBS source 描述为 30fps；物理采集也固定 30fps
+static const double     kSendFPS = 30.0;
+static const int64_t    kIdleGraceNs = 5 * NSEC_PER_SEC;
 static volatile sig_atomic_t g_running = 1;
 static void on_signal(int sig) { (void)sig; g_running = 0; }
 
@@ -35,7 +34,6 @@ static bool acquireSingleInstanceLock() {
     return true;
 }
 
-// ---- CMIO 工具 ----
 static OSStatus getCMIOProperty(CMIOObjectID obj, CMIOObjectPropertySelector sel,
                                 CMIOObjectPropertyScope scope, CMIOObjectPropertyElement element,
                                 void *data, UInt32 *dataSize) {
@@ -93,7 +91,6 @@ static bool findSinkStream(CMIOObjectID *outDevice, CMIOStreamID *outSinkStream,
             UInt32 sCount = sSize / sizeof(CMIOStreamID);
             fprintf(stderr, "  streams: %u\n", sCount);
 
-            // direction 属性在 OBS 扩展上不可靠：官方 feeder 使用 index 1 作为 sink。
             for (UInt32 ti = 0; ti < sCount; ti++) {
                 UInt32 dir = 99;
                 CMIOObjectPropertyAddress dirAddr = {kCMIOStreamPropertyDirection,
@@ -106,6 +103,7 @@ static bool findSinkStream(CMIOObjectID *outDevice, CMIOStreamID *outSinkStream,
                 fprintf(stderr, "    stream[%u] id=%u direction=%u (%s)\n", ti, streams[ti], dir,
                         dir == 0 ? "OUT/source" : (dir == 1 ? "IN/sink" : "?"));
             }
+
             UInt32 tryOrder[2] = {1, 0};
             UInt32 tryCount = sCount >= 2 ? 2 : sCount;
             for (UInt32 ti = 0; ti < tryCount; ti++) {
@@ -118,22 +116,19 @@ static bool findSinkStream(CMIOObjectID *outDevice, CMIOStreamID *outSinkStream,
                 if (qs == noErr && q) {
                     *outDevice = devices[i];
                     *outSinkStream = streams[si];
-                    if (outQueue) {
-                        *outQueue = q;
-                    } else {
-                        CFRelease(q);
-                    }
+                    if (outQueue) *outQueue = q;
+                    else CFRelease(q);
                     fprintf(stderr, "  -> using stream[%u] as sink (OBS 官方 index 1)\n", si);
                     return true;
                 }
             }
-            fprintf(stderr, "  ERROR: no sink queue\n"); return false;
+            fprintf(stderr, "  ERROR: no sink queue\n");
+            return false;
         }
     }
     return false;
 }
 
-// ---- 帧转换 BGR -> NV12（与 OBS 官方喂帧格式一致，BT.601 limited range）----
 static void bgr_to_nv12(const uint8_t *bgr, uint8_t *yPlane, uint8_t *uvPlane,
                         size_t w, size_t h) {
     const size_t yStride = w;
@@ -195,19 +190,15 @@ int main(int argc, char *argv[]) {
         if (devs.empty()) { fprintf(stderr, "[ps3eye-feed] ERROR: no PS3 Eye\n"); return 4; }
         auto cam = devs[0];
         if (!cam->init((uint32_t)kWidth, (uint32_t)kHeight, 30)) {
-            fprintf(stderr, "[ps3eye-feed] ERROR: camera init failed\n"); return 5;
+            fprintf(stderr, "[ps3eye-feed] ERROR: camera init failed\n");
+            return 5;
         }
-
-        // 室内稳定默认：让 OV772x 自己执行 AEC/AGC/AWB，避免固定低增益/曝光造成明显欠曝。
         cam->setAutogain(true);
         cam->setAutoWhiteBalance(true);
         cam->setBrightness(24);
-        cam->start();
-        cam->setLed(true);
-        fprintf(stderr, "[ps3eye-feed] PS3 Eye streaming 640x480@30 (AEC/AGC/AWB enabled)\n");
+        cam->setLed(false);
+        fprintf(stderr, "[ps3eye-feed] PS3 Eye idle (sensor not streaming)\n");
 
-        // sink 一次性打开并保持。旧版每 4 秒 StopStream/StartStream 的“眨眼探测”
-        // 会让部分 AVFoundation/CMIO 客户端把虚拟摄像头视为掉线或重连。
         OSStatus qs = CMIOStreamCopyBufferQueue(sink,
                                                 [](CMIOStreamID, void *, void *) {},
                                                 NULL, &queue);
@@ -222,7 +213,7 @@ int main(int argc, char *argv[]) {
             queue = NULL;
             return 8;
         }
-        fprintf(stderr, "[ps3eye-feed] sink stream started (persistent)\n");
+        fprintf(stderr, "[ps3eye-feed] sink stream started (persistent idle probe)\n");
 
         NSDictionary *pbAttr = @{
             (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
@@ -237,18 +228,70 @@ int main(int argc, char *argv[]) {
         CMVideoFormatDescriptionRef fmt = NULL;
         CMVideoFormatDescriptionCreate(kCFAllocatorDefault, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
                                        kWidth, kHeight, NULL, &fmt);
+        CMTime duration = CMTimeMake(1, (int32_t)kSendFPS);
+
+        auto enqueueFrame = [&](const uint8_t *bgr, bool blackFrame) -> bool {
+            if (!queue || CMSimpleQueueGetFullness(queue) >= 1.0) return false;
+            CVPixelBufferRef pb = NULL;
+            CVReturn cv = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &pb);
+            if (cv != kCVReturnSuccess || !pb) return false;
+            CVPixelBufferLockBaseAddress(pb, 0);
+            uint8_t *yPlane  = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+            uint8_t *uvPlane = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 1);
+            size_t yBytes = CVPixelBufferGetBytesPerRowOfPlane(pb, 0) * kHeight;
+            size_t uvBytes = CVPixelBufferGetBytesPerRowOfPlane(pb, 1) * (kHeight / 2);
+            if (blackFrame) {
+                memset(yPlane, 16, yBytes);
+                memset(uvPlane, 128, uvBytes);
+            } else {
+                bgr_to_nv12(bgr, yPlane, uvPlane, kWidth, kHeight);
+            }
+            CVPixelBufferUnlockBaseAddress(pb, 0);
+
+            int64_t nowNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+            CMTime pts = CMTimeMake(nowNs, NSEC_PER_SEC);
+            CMSampleTimingInfo timing = {duration, pts, kCMTimeInvalid};
+            CMSampleBufferRef sb = NULL;
+            OSStatus ss = CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, pb, true, NULL, NULL,
+                                                             fmt, &timing, &sb);
+            CVPixelBufferRelease(pb);
+            if (ss != noErr || !sb) return false;
+            CMSimpleQueueEnqueue(queue, sb);
+            return true;
+        };
+
+        // IDLE：只往 OBS sink 放一张黑色探针帧。
+        // 没有消费者时 queue 会保持满；消费者一打开 source，这张帧会被取走，
+        // feeder 无需 StopStream/StartStream 就能知道“真的有人在用”。
+        bool probeQueued = false;
+        while (g_running) {
+            double fullness = CMSimpleQueueGetFullness(queue);
+            if (probeQueued && fullness < 1.0) {
+                fprintf(stderr, "[ps3eye-feed] consumer detected; starting physical camera\n");
+                break;
+            }
+            if (!probeQueued && fullness < 1.0) {
+                if (enqueueFrame(NULL, true)) probeQueued = true;
+            }
+            usleep(100 * 1000);
+        }
+        if (!g_running) return 0;
+
+        cam->start();
+        cam->setLed(true);
+        fprintf(stderr, "[ps3eye-feed] PS3 Eye streaming 640x480@30 (AEC/AGC/AWB enabled)\n");
 
         std::vector<uint8_t> bgr(kWidth * kHeight * 3);
-        CMTime duration = CMTimeMake(1, (int32_t)kSendFPS);
         uint64_t frameCount = 0;
+        int64_t lastConsumerDrainNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        std::atomic<int64_t> lastFrameNs(lastConsumerDrainNs);
+        std::atomic<bool> captureActive(true);
 
-        // PS3EYEDriver 的旧错误回调可能在 libusb event thread 内进入阻塞式 close_transfers()。
-        // 不在回调里再次做同步清理；由独立 watchdog 检测“没有新帧”并让 LaunchAgent 干净重启进程。
-        std::atomic<int64_t> lastFrameNs(clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
-        std::thread watchdog([&lastFrameNs]() {
+        std::thread watchdog([&lastFrameNs, &captureActive]() {
             const int64_t kStallNs = 3 * NSEC_PER_SEC;
             while (g_running) {
                 usleep(500 * 1000);
+                if (!captureActive.load(std::memory_order_relaxed)) continue;
                 int64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
                 if (now - lastFrameNs.load(std::memory_order_relaxed) > kStallNs) {
                     fprintf(stderr, "[ps3eye-feed] FATAL: no camera frame for 3s; exiting for LaunchAgent recovery\n");
@@ -259,41 +302,31 @@ int main(int argc, char *argv[]) {
         });
 
         while (g_running) {
-            cam->getFrame(bgr.data()); // blocks until physical frame (~30fps)
+            cam->getFrame(bgr.data());
             int64_t nowNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
             lastFrameNs.store(nowNs, std::memory_order_relaxed);
 
-            // sink buffer queue size = 1；无消费者/消费者慢时直接丢帧，不重启 stream。
-            if (!queue || CMSimpleQueueGetFullness(queue) >= 1.0) continue;
-
-            CVPixelBufferRef pb = NULL;
-            CVReturn cv = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &pb);
-            if (cv != kCVReturnSuccess) continue;
-            CVPixelBufferLockBaseAddress(pb, 0);
-            uint8_t *yPlane  = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 0);
-            uint8_t *uvPlane = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 1);
-            bgr_to_nv12(bgr.data(), yPlane, uvPlane, kWidth, kHeight);
-            CVPixelBufferUnlockBaseAddress(pb, 0);
-
-            // 每个真正送出的 sample 都使用当前单调时钟，避免长时间无人消费后 PTS 落后数分钟。
-            CMTime pts = CMTimeMake(nowNs, NSEC_PER_SEC);
-            CMSampleTimingInfo timing = {duration, pts, kCMTimeInvalid};
-            CMSampleBufferRef sb = NULL;
-            OSStatus ss = CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, pb, true, NULL, NULL,
-                                                             fmt, &timing, &sb);
-            CVPixelBufferRelease(pb);
-            if (ss == noErr && sb) {
-                CMSimpleQueueEnqueue(queue, sb);
-                // 不 CFRelease(sb)：queue/framework 负责消费后的引用释放，与 OBS feeder 行为一致。
-                frameCount++;
-                if (frameCount % 30 == 0)
-                    fprintf(stderr, "[ps3eye-feed] %llu frames sent\n", (unsigned long long)frameCount);
+            if (queue && CMSimpleQueueGetFullness(queue) < 1.0) {
+                if (enqueueFrame(bgr.data(), false)) {
+                    lastConsumerDrainNs = nowNs;
+                    frameCount++;
+                    if (frameCount % 30 == 0)
+                        fprintf(stderr, "[ps3eye-feed] %llu frames sent\n", (unsigned long long)frameCount);
+                }
+            } else if (nowNs - lastConsumerDrainNs > kIdleGraceNs) {
+                // 不调用 cam->stop()：旧 PS3EYEDriver 的 stop() 会 cancel URB 并可能在 libusb
+                // callback 线程里自锁。这里先灭 LED，再 _Exit() 跳过 C++ 析构；macOS 回收 USB handle。
+                // LaunchAgent 2 秒后拉起新的待机 feeder，新的进程只 init，不 start 物理摄像头。
+                fprintf(stderr, "[ps3eye-feed] no consumer for 5s; physical camera entering idle\n");
+                cam->setLed(false);
+                fflush(stderr);
+                std::_Exit(0);
             }
         }
 
+        captureActive.store(false, std::memory_order_relaxed);
         if (watchdog.joinable()) watchdog.join();
 
-        // 退出阶段仍不调用 cam->stop()；进程退出由 OS 回收 libusb 传输，避免旧驱动 stop 路径自锁。
         fprintf(stderr, "[ps3eye-feed] stopping...\n");
         CMIODeviceStopStream(device, sink);
         if (queue) { CFRelease(queue); queue = NULL; }
