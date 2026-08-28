@@ -2,270 +2,557 @@
 
 # 📷 PS3Eye-VirtualCam
 
-**让 PS3 Eye 摄像头变成 macOS 系统级虚拟摄像头，供任何 App 使用（人脸追踪 / 直播 / 会议）**
+**在 Apple Silicon Mac 上把 PlayStation 3 Eye 变成系统级虚拟摄像头。**
 
-*Turn a PlayStation 3 Eye camera into a system-wide macOS virtual camera for any app (face tracking / streaming / meetings)*
+通过用户态 `libusb + PS3EYEDriver + CoreMediaIO` 抓取 PS3 Eye 画面，再把视频帧送入 **OBS Virtual Camera**，供 QuickTime、浏览器、会议软件、直播软件等使用。
 
-[![Status](https://img.shields.io/badge/状态-BETA%20v0.1.1-yellow?style=for-the-badge)](https://github.com/BH2VOQ/PS3Eye-VirtualCam/releases)
-[![License](https://img.shields.io/badge/许可-GPLv2-blue?style=for-the-badge)](LICENSE)
-[![Platform](https://img.shields.io/badge/平台-macOS%20Apple%20Silicon-lightgrey?style=for-the-badge)]()
-[![Lang](https://img.shields.io/badge/语言-ObjC++%2FC%2B%2B-green?style=for-the-badge)]()
-
-**中文** | [**English**](#english)
+[![Platform](https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-lightgrey?style=flat-square)]()
+[![License](https://img.shields.io/badge/license-GPLv2-blue?style=flat-square)](LICENSE)
+[![Build](https://img.shields.io/badge/build-macOS%20CI-success?style=flat-square)]()
 
 </div>
 
 ---
 
-<a name="chinese"></a>
+## 项目是怎么工作的
 
-# 🌊 中文
+PS3 Eye 本身没有现代 macOS 原生驱动。本项目不安装内核驱动，而是在用户态直接通过 `libusb` 与 PS3 Eye 的 OV534/OV772x 硬件通信。
 
-> ⚠️ **BETA — v0.1.1-beta**
-> 功能可用，画面已人工验收；无消费者自动熄灭已修复。欢迎试用并提 issue。
+整体数据链路如下：
 
-PS3 Eye（索尼 PlayStation 3 摄像头）是性价比极高的 USB 摄像头（OV534 芯片，支持 640x480@60fps / 320x240@120fps），但在 macOS 上没有任何原生驱动。本项目通过 **OBS 的官方虚拟摄像头扩展** 把它变成系统级摄像头——任何 App（Photo Booth、Zoom、OBS、vtuber 人脸追踪等）都能直接选中使用。
-
-## ✨ 特性
-
-- 🎥 **系统级虚拟摄像头**：基于 OBS mac-virtualcam 扩展，所有 App 可见
-- 🔌 **即插即用**：无需付费开发者账号、无需关闭 SIP、无需内核驱动
-- 🔋 **无消费者自动熄灭**：没有 App 在用时 LED 自动熄灭、停止供帧；有 App 打开时立即恢复
-- 🔄 **后台常驻**：LaunchAgent 开机自启、崩溃自动拉起；菜单栏 App 退出不影响驱动
-- 🍎 **Apple Silicon 原生**：arm64 原生编译（静态链接 libusb，无 Homebrew 依赖）
-- 🛠 **纯命令行**：一键构建 + 一键启停，无 GUI 依赖
-
-## 🚀 安装（推荐：菜单栏 App）
-
-下载 [DMG](https://github.com/BH2VOQ/PS3Eye-VirtualCam/releases)，打开后把 `PS3Eye-VirtualCam.app` 拖入 Applications：
-
-1. 双击 App → **自动安装驱动**（拷贝到 `~/Library/Application Support/PS3Eye-VirtualCam/`，注册 LaunchAgent `com.bh2voq.ps3eye-vcam` 开机自启）
-2. 菜单栏出现 🎥 图标：显示状态（待机/推流中/未运行），可手动启停、打开日志
-3. 退出 App 不影响驱动——驱动由 LaunchAgent **常驻后台**，重启电脑后依然自动运行
-
-⚠️ 未签名 App 首次双击如被 Gatekeeper 拦截：右键 → 打开。
-
-CLI 方式：`./scripts/install-agent.sh`（常驻）或 `./scripts/start.sh`（前台）。
-
-## 🚀 技术路线
-
-```
-┌─────────────┐    libusb     ┌──────────────────┐   CMIO   ┌───────────────────┐
-│  PS3 Eye    │ ────────────▶ │  ps3eye-feed     │ ───────▶ │ OBS Virtual       │
-│  (OV534)    │   USB 抓帧    │  (单进程主程序)   │  NV12 帧 │ Camera 扩展       │
-└─────────────┘               └──────────────────┘          │ (系统级虚拟摄像头) │
-       640x480@60fps                 │  ▲                    └───────────────────┘
-                                     │  │ 自带消费者检测（CMIO）         │
-                                     │  │ IDLE: 1s 轮询 gone            ▼
-                                     │  │ ACTIVE: 4s 眨眼探测  ┌─────────────────────┐
-                                     ▼  │                    │ Photo Booth / Zoom  │
-                              (无独立进程)                    │ OBS / vtuber 等 App  │
-                                                             └─────────────────────┘
+```text
+PS3 Eye
+  │
+  │ USB / libusb
+  ▼
+PS3EYEDriver
+  │
+  │ 640×480 @ 30 fps
+  ▼
+ps3eye-feed
+  │
+  │ CoreMediaIO / CMSimpleQueue
+  │ NV12 视频帧
+  ▼
+OBS Camera Extension
+  │
+  ▼
+OBS Virtual Camera
+  │
+  ├─ QuickTime
+  ├─ 浏览器
+  ├─ Discord / Zoom / Teams
+  ├─ OBS
+  └─ 其他支持 macOS 摄像头的 App
 ```
 
-**单进程设计（为什么）：**
+### 1. PS3 Eye → `ps3eye-feed`
 
-1. **ps3eye-feed（唯一进程）**：libusb 从 PS3 Eye 抓帧（NV12 640x480），通过 CMIO 往 OBS 虚拟摄像头的 sink 流喂帧；OBS 扩展负责转发为系统级 source 流。
-2. **自带消费者检测**：直接查 CMIO `kCMIODevicePropertyDeviceIsRunningSomewhere`，无需独立检测进程：
-   - **IDLE（sink 关闭）**：每秒查一次——此时没有自身 sink 干扰，信号干净，消费者到达即开。
-   - **ACTIVE（sink 打开）**：每 4s 做「眨眼探测」——关 sink 50ms → 查 gone → 消费者还在就重开（画面仅丢 1 帧，无感）；已离开就熄 LED 回待机。
-   - ⚠️ 不能用 AVFoundation `isInUseByAnotherApplication`（OBS 扩展未实现，恒 0）；也不能常驻用 gone（自己的 sink 会把它顶成恒 1，消费者走了不复位）。
-3. **省电策略**：摄像头启动后**永不调用 `stop()`**——ps3eye 库的 stop() 在持续负载下会触发 libusb 自锁断言崩溃（写 0xe0 停流 → 在途传输出错 → 回调在传输线程内 close_transfers 与 handle_events 自锁，实测）。空闲时只熄 LED + 关 sink 停止供帧，App 打开瞬间恢复。
+`src/ps3eye-feed.mm` 是核心 feeder。
 
-**为什么不用其他方案：**
+它通过仓库中的 PS3EYEDriver 和静态链接的 libusb 直接读取 PS3 Eye：
 
-| 方案 | 结论 |
-|---|---|
-| 自研 system extension（付费开发者账号） | ❌ $99/年，普通用户不划算 |
-| 自研用户态 CMIOExtension 虚拟摄像头 | ❌ 需签名/激活，复杂度高 |
-| 本地 MJPEG 直接供帧给单个 App | ⚠️ 仅单 App 可用，非系统级 |
-| **OBS 官方扩展 + 极简喂帧客户端（本项目）** | ✅ 免费、系统级、无需开发者账号 |
+- 分辨率：`640×480`
+- 帧率：`30 fps`
+- 自动增益：开启
+- 自动白平衡：开启
+- 亮度：针对 macOS 使用场景做了提高
 
-## 🚀 部署
+摄像头输出的 BGR 图像会在 feeder 中转换成 NV12，再提交给 CoreMediaIO。
 
-> ⚠️ **由 AI agent 自动构建并复核**：本项目源码与构建脚本由 AI agent 编写与联调。自动构建有边界情况（不同 macOS 版本、不同 Xcode CLT 版本可能影响编译），请按下方检查清单核对。如果你对构建不熟，直接使用 [Releases](https://github.com/BH2VOQ/PS3Eye-VirtualCam/releases) 里的预编译包。
+### 2. `ps3eye-feed` → OBS Virtual Camera
 
-**前置条件：**
+本项目目前复用 OBS 官方 Camera Extension，而不是自己再实现一整套 macOS Camera Extension。
 
-- macOS（Apple Silicon，M 系列芯片）
-- Xcode 命令行工具：`xcode-select --install`
-- **OBS Studio** 已安装，且虚拟摄像头扩展已激活（OBS → Tools → Start Virtual Camera，首次需在系统设置允许扩展）
-- PS3 Eye 摄像头（USB-A 转接头插入）
+`ps3eye-feed` 会：
 
-**构建（约 30 秒）：**
+1. 找到系统中的 `OBS Virtual Camera` CoreMediaIO 设备；
+2. 找到它的 sink stream；
+3. 通过 `CMIOStreamCopyBufferQueue()` 获取帧队列；
+4. 将 PS3 Eye 的视频帧持续写入该队列；
+5. OBS Camera Extension 再把这些帧转发成系统可见的虚拟摄像头 source stream。
+
+因此最终使用摄像头的软件不需要知道 PS3 Eye，也不需要支持 libusb，只需要选择：
+
+```text
+OBS Virtual Camera
+```
+
+### 3. 为什么现在使用“手动开关”
+
+早期版本尝试过自动判断“是否有 App 正在使用虚拟摄像头”，包括：
+
+- `kCMIODevicePropertyDeviceIsRunningSomewhere`
+- `AVCaptureDevice.inUseByAnotherApplication`
+- OBS sink queue 是否被消费
+- 周期性关闭/reopen sink 进行探测
+
+这些方法在 OBS Camera Extension 上都存在边界问题：
+
+- feeder 自己启动 sink 后，也会影响 CMIO 的 running 状态；
+- OBS Extension 本身会消费 sink queue，不能代表真正有最终用户；
+- AVFoundation 对虚拟 Camera Extension 的使用状态并不可靠；
+- 周期性 Stop/Start sink 会让 QuickTime 等应用看到短暂断流。
+
+实际表现就是曾经出现过“约 10 秒关闭一次，然后迅速恢复”的问题。
+
+因此当前版本采用更稳定的策略：
+
+> **后台 feeder 常驻，但物理 PS3 Eye 默认关闭；由用户在菜单栏手动启用或关闭摄像头。**
+
+这样可以避免任何错误的消费者检测导致正在使用中的摄像头被自动关闭。
+
+### 4. 为什么关闭摄像头时会重启 feeder
+
+PS3EYEDriver 的旧 libusb 停流路径存在一个已知风险：传输 callback 中可能进入同步 transfer 清理，导致 libusb 事件线程发生 mutex assertion / self-deadlock。
+
+因此当前版本不会在高负载运行中频繁调用危险的 `cam->stop()`。
+
+关闭摄像头时采用：
+
+```text
+菜单栏写入 OFF 状态
+      ↓
+feeder 检测到 OFF
+      ↓
+关闭 LED
+      ↓
+进程安全退出（跳过危险析构路径）
+      ↓
+LaunchAgent 自动重新拉起 feeder
+      ↓
+重新进入“待机、物理摄像头关闭”状态
+```
+
+这也是为什么后台 feeder 可以长期存在，但 PS3 Eye 本体并不需要一直工作。
+
+---
+
+# 使用教程
+
+## 1. 前置条件
+
+需要：
+
+- Apple Silicon Mac（M1 / M2 / M3 / M4 等）
+- macOS
+- PS3 Eye 摄像头
+- OBS Studio
+- Xcode Command Line Tools（如果从源码构建）
+
+安装 Xcode Command Line Tools：
+
+```bash
+xcode-select --install
+```
+
+### OBS Virtual Camera
+
+必须先让系统中存在 `OBS Virtual Camera`。
+
+安装 OBS Studio 后，至少启动一次 OBS，并确认虚拟摄像头扩展已经在系统中启用。
+
+如果 macOS 要求允许 Camera Extension，请在系统设置中允许。
+
+---
+
+## 2. 从源码安装
+
+克隆仓库：
 
 ```bash
 git clone https://github.com/BH2VOQ/PS3Eye-VirtualCam.git
 cd PS3Eye-VirtualCam
+```
+
+构建 feeder：
+
+```bash
 ./build.sh
 ```
 
-**启动：**
+安装后台 LaunchAgent：
 
 ```bash
-./scripts/start.sh
+./scripts/install-agent.sh
 ```
 
-**使用：** 打开任意 App（Photo Booth / Zoom / OBS / vtuber），摄像头列表选 **OBS Virtual Camera** 即可看到实时画面。
+成功时会看到类似：
 
-**停止：**
-
-```bash
-./scripts/stop.sh
+```text
+✅ LaunchAgent 已安装并常驻运行（开机自启）
 ```
 
-## 📁 仓库内容
+后台程序安装到：
 
-| 路径 | 说明 |
-|---|---|
-| `src/ps3eye-feed.mm` | 主程序：libusb 抓帧 → CMIO 喂帧 OBS 虚拟摄像头（自带消费者检测） |
-| `src/ps3eye/` | PS3EYEDriver 库源码（OV534 驱动移植） |
-| `lib/libusb/` | arm64 静态链接的 libusb 1.0.30 |
-| `scripts/start.sh` / `stop.sh` | 一键启停（含 OBS 扩展激活检测） |
-| `build.sh` | 一键构建（arm64 原生） |
-| `bin/` | 构建产物 |
+```text
+~/Library/Application Support/PS3Eye-VirtualCam/ps3eye-feed
+```
 
-## ❓ FAQ
+日志位于：
 
-| 问题 | 回答 |
-|---|---|
-| 为什么没有画面？ | 首次使用需在系统设置允许 OBS 扩展，并在 App 里授权相机权限（Photo Booth 会弹窗） |
-| 支持 Intel Mac 吗？ | 暂不支持（构建脚本固定 arm64）；Intel 可自行去掉 `-arch arm64` 重编译 |
-| 摄像头 LED 不亮？ | 正常——无消费者时自动熄灭省电；打开 App 选中后会自动亮起 |
-| 与其他 App 冲突吗？ | 同一时间仅一个 App 能占用虚拟摄像头（系统限制），关闭当前 App 即可切换 |
-
-## 📜 许可 & 🏷 版本
-
-- **GPLv2**（见 [LICENSE](LICENSE)）——基于 [PS3EYEDriver](https://github.com/inspirit/PS3EYEDriver)（MIT + GPLv2 派生）与 [OBS mac-virtualcam](https://github.com/johnboiles/obs-mac-virtualcam)（GPLv2）分支
-- 当前版本：**v0.1.1-beta**（画面已人工验收，自动停止修复）
-- 不含任何闭源组件；libusb 为 LGPL 静态链接（本项目按 GPLv2 分发，满足链接例外条款）
-
-## 🙏 鸣谢
-
-**inspirit（PS3EYEDriver）** — OV534 驱动移植与 ps3eye 抓帧库。感谢！
-**johnboiles（obs-mac-virtualcam）** — OBS 虚拟摄像头扩展。感谢！
-**OBS Project** — 虚拟摄像头扩展的官方维护方。感谢！
+```text
+~/Library/Logs/PS3Eye-VirtualCam/feed.log
+```
 
 ---
 
-<div align="center">[**English**](#english) · **中文**</div>
-
-<a name="english"></a>
-
-# 🌊 English
-
-> ⚠️ **BETA — v0.1.1-beta**
-> Feature-complete, picture human-verified, auto-off fixed. Issues and feedback welcome.
-
-The PlayStation 3 Eye is an excellent cheap USB camera (OV534 chipset, 640x480@60fps / 320x240@120fps) with **no native macOS driver**. This project turns it into a **system-wide virtual camera** via OBS's official virtual camera extension — usable by any app (Photo Booth, Zoom, OBS, vtuber face tracking, etc.).
-
-## ✨ Features
-
-- 🎥 **System-wide virtual camera** based on the OBS mac-virtualcam extension
-- 🔌 **Plug & play**: no paid developer account, no SIP disable, no kernel driver
-- 🔋 **Auto-off when unused**: LED turns off and frame feeding stops when no app consumes the camera; resumes instantly on demand
-- 🔄 **Background resident**: LaunchAgent starts at login and auto-restarts on crash; quitting the menu-bar app does not stop the driver
-- 🍎 **Apple Silicon native**: arm64 build, statically-linked libusb (no Homebrew dependency)
-- 🛠 **CLI only**: one-command build + one-command start/stop
-
-## 🚀 Architecture
-
-```
-┌─────────────┐    libusb     ┌──────────────────┐   CMIO   ┌───────────────────┐
-│  PS3 Eye    │ ────────────▶ │  ps3eye-feed     │ ───────▶ │ OBS Virtual       │
-│  (OV534)    │   USB frames  │  (single process)│  NV12    │ Camera extension  │
-└─────────────┘               └──────────────────┘          └───────────────────┘
-       640x480@60fps                 │  ▲                          │
-                                     │  │ built-in consumer        ▼
-                                     │  │ detection (CMIO)   ┌─────────────────────┐
-                                     ▼  │ IDLE: poll 1s       │ Photo Booth / Zoom  │
-                              (no watchdog      │ ACTIVE: 4s blink │ OBS / vtuber apps   │
-                               process)         ▼                  └─────────────────────┘
-```
-
-**Single-process design (why):**
-
-1. **ps3eye-feed (the only process)**: grabs NV12 640x480 frames via libusb and pushes them into the OBS virtual camera's sink stream through CMIO.
-2. **Built-in consumer detection**: queries CMIO `kCMIODevicePropertyDeviceIsRunningSomewhere` directly — no separate watchdog process:
-   - **IDLE (sink closed)**: poll every second — no self-sink interference, clean signal; opens as soon as a consumer arrives.
-   - **ACTIVE (sink open)**: a 50ms "blink probe" every 4s — close sink → query `gone` → reopen if the consumer is still there (only 1 frame dropped, imperceptible); if gone, LED off and back to idle.
-   - ⚠️ `AVCaptureDevice.isInUseByAnotherApplication` is not usable (the OBS extension never implements it — always 0); a permanent `gone` check is also unusable (our own sink keeps it at 1 forever, even after the consumer leaves).
-3. **Power strategy**: after first start the camera **never calls `stop()`** — the ps3eye library's stop() self-deadlocks under sustained load (writing 0xe0 to stop the stream makes in-flight transfers error out; the callback then calls close_transfers() from the transfer thread while inside libusb_handle_events → assertion crash, verified). Idle = LED off + sink closed (no frames pushed); resumes instantly when an app opens the camera.
-
-**Why not other approaches:**
-
-| Approach | Verdict |
-|---|---|
-| Custom system extension ($99/yr dev account) | ❌ Not worth it for regular users |
-| Custom user-space CMIOExtension virtual camera | ❌ Signing/activation complexity |
-| Local MJPEG to a single app | ⚠️ Not system-wide |
-| **OBS official extension + minimal feeder (this project)** | ✅ Free, system-wide, no dev account |
-
-## 🚀 Deployment
-
-> ⚠️ **Built and verified by an AI agent.** Source and build scripts were authored and debugged by an AI agent; edge cases may exist across macOS/Xcode CLT versions. Use the checklist below, or grab a prebuilt binary from [Releases](https://github.com/BH2VOQ/PS3Eye-VirtualCam/releases) if you don't want to build.
-
-**Prerequisites:**
-
-- macOS on Apple Silicon (M-series)
-- Xcode Command Line Tools: `xcode-select --install`
-- **OBS Studio** installed with the virtual camera extension activated (OBS → Tools → Start Virtual Camera; allow the extension in System Settings on first run)
-- PS3 Eye camera connected via USB-A adapter
-
-**Build (~30s):**
+## 3. 构建菜单栏 App
 
 ```bash
-git clone https://github.com/BH2VOQ/PS3Eye-VirtualCam.git
-cd PS3Eye-VirtualCam
+./scripts/build-app.sh
+```
+
+菜单栏 App 负责：
+
+- 显示当前状态；
+- 启用摄像头；
+- 关闭摄像头；
+- 打开日志；
+- 自动维护后台 feeder 和 LaunchAgent。
+
+首次运行 App 时，它会把当前打包的 feeder 安装/更新到 Application Support，并刷新 LaunchAgent。
+
+---
+
+## 4. 菜单栏怎么用
+
+当前版本推荐直接使用菜单栏开关。
+
+### 默认状态
+
+登录 macOS 或安装完成后，feeder 会在后台运行，但 PS3 Eye 默认关闭。
+
+菜单栏状态类似：
+
+```text
+PS3 Eye: 待机（已关闭）
+启用摄像头
+打开日志
+退出菜单栏（后台保持待机）
+```
+
+此时：
+
+- PS3 Eye LED 应该是灭的；
+- 物理摄像头不持续采集；
+- 后台 feeder 保持运行；
+- `OBS Virtual Camera` 仍由 OBS Camera Extension 提供给系统。
+
+### 启用摄像头
+
+点击：
+
+```text
+启用摄像头
+```
+
+feeder 检测到手动开关为 ON 后会：
+
+1. 打开 OBS Virtual Camera sink；
+2. 启动 PS3 Eye；
+3. 点亮 LED；
+4. 持续推送 `640×480 @ 30fps` 画面。
+
+日志会出现：
+
+```text
+[ps3eye-feed] manual switch ON; starting sink + physical camera
+[ps3eye-feed] PS3 Eye streaming 640x480@30 (manual ON)
+```
+
+菜单栏状态会变为：
+
+```text
+PS3 Eye: 推流中
+关闭摄像头
+```
+
+### 在其他 App 中使用
+
+先在菜单栏点击 **启用摄像头**，然后在目标软件里选择：
+
+```text
+OBS Virtual Camera
+```
+
+例如 QuickTime：
+
+```text
+QuickTime Player
+→ 文件
+→ 新建影片录制
+→ 摄像头选择 OBS Virtual Camera
+```
+
+### 关闭摄像头
+
+使用结束后，在菜单栏点击：
+
+```text
+关闭摄像头
+```
+
+日志会出现：
+
+```text
+[ps3eye-feed] manual switch OFF; physical camera entering standby
+```
+
+PS3 Eye LED 会熄灭。
+
+LaunchAgent 随后重新拉起一个新的 feeder，并停在待机状态。
+
+---
+
+## 5. 更新项目
+
+更新源码：
+
+```bash
+cd ~/PS3Eye-VirtualCam
+git pull
+```
+
+重新构建：
+
+```bash
 ./build.sh
 ```
 
-**Start:**
+重新安装后台 feeder：
 
 ```bash
-./scripts/start.sh
+./scripts/install-agent.sh
 ```
 
-**Use:** open any app (Photo Booth / Zoom / OBS / vtuber), pick **OBS Virtual Camera** from the camera list.
-
-**Stop:**
+如果也使用菜单栏 App，再重新构建：
 
 ```bash
-./scripts/stop.sh
+./scripts/build-app.sh
 ```
 
-## 📁 Repository Contents
+推荐的完整更新流程：
 
-| Path | Description |
-|---|---|
-| `src/ps3eye-feed.mm` | Main feeder: libusb capture → CMIO frames into OBS virtual camera (built-in consumer detection) |
-| `src/ps3eye/` | PS3EYEDriver library source (OV534 driver port) |
-| `lib/libusb/` | arm64 static libusb 1.0.30 |
-| `scripts/start.sh` / `stop.sh` | One-command start/stop (with OBS extension check) |
-| `build.sh` | One-command build (arm64 native) |
-| `bin/` | Build output |
+```bash
+cd ~/PS3Eye-VirtualCam
+git pull
+./build.sh
+./scripts/install-agent.sh
+./scripts/build-app.sh
+```
 
-## ❓ FAQ
-
-| Question | Answer |
-|---|---|
-| No picture? | First run: allow the OBS extension in System Settings and grant camera permission in your app (Photo Booth prompts) |
-| Intel Mac support? | Not yet (build script is arm64-only); remove `-arch arm64` and rebuild if you want |
-| LED not on? | Normal — auto-off when unused; it lights up when an app selects the camera |
-| Conflicts with other apps? | Only one app can use the virtual camera at a time (system limit); close the current app to switch |
-
-## 📜 License & 🏷 Version
-
-- **GPLv2** (see [LICENSE](LICENSE)) — forked from [PS3EYEDriver](https://github.com/inspirit/PS3EYEDriver) (MIT + GPLv2 derived) and [OBS mac-virtualcam](https://github.com/johnboiles/obs-mac-virtualcam) (GPLv2)
-- Current version: **v0.1.1-beta** (picture human-verified, auto-off fix included)
-- No closed-source components; libusb is LGPL statically linked (distributed under GPLv2 per the linking exception)
-
-## 🙏 Acknowledgements
-
-**inspirit (PS3EYEDriver)** — OV534 driver port and ps3eye capture library. Thank you!
-**johnboiles (obs-mac-virtualcam)** — OBS virtual camera extension. Thank you!
-**OBS Project** — official maintainers of the virtual camera extension. Thank you!
+`install-agent.sh` 会主动卸载旧的 LaunchAgent 状态，再注册新版本，避免 macOS `launchctl bootstrap` 因残留任务状态失败。
 
 ---
 
-<div align="center">[**中文**](#chinese) · **English**</div>
+# 日志与排查
+
+## 查看实时日志
+
+```bash
+tail -f "$HOME/Library/Logs/PS3Eye-VirtualCam/feed.log"
+```
+
+查看最近 50 行：
+
+```bash
+tail -n 50 "$HOME/Library/Logs/PS3Eye-VirtualCam/feed.log"
+```
+
+清空旧日志后重新测试：
+
+```bash
+: > "$HOME/Library/Logs/PS3Eye-VirtualCam/feed.log"
+```
+
+---
+
+## 检查 feeder 是否运行
+
+```bash
+pgrep -fl ps3eye-feed
+```
+
+正常会看到类似：
+
+```text
+44958 /Users/yourname/Library/Application Support/PS3Eye-VirtualCam/ps3eye-feed
+```
+
+---
+
+## 正常待机日志
+
+```text
+[ps3eye-feed] starting (manual control mode)
+[ps3eye-feed] PS3 Eye standby; manual switch is OFF
+```
+
+此时 LED 应该熄灭。
+
+---
+
+## 正常启用日志
+
+```text
+[ps3eye-feed] manual switch ON; starting sink + physical camera
+[ps3eye-feed] PS3 Eye streaming 640x480@30 (manual ON)
+[ps3eye-feed] 30 frames sent
+[ps3eye-feed] 60 frames sent
+[ps3eye-feed] 90 frames sent
+```
+
+只要帧数持续增长，说明 feeder 正在正常向 OBS Virtual Camera 推流。
+
+---
+
+## QuickTime 没画面
+
+依次检查：
+
+1. 菜单栏是否已经点击 **启用摄像头**；
+2. PS3 Eye LED 是否亮起；
+3. 日志是否出现 `frames sent`；
+4. QuickTime 是否选择了 `OBS Virtual Camera`；
+5. OBS Camera Extension 是否已经安装并被 macOS 允许；
+6. macOS 是否给 QuickTime/目标 App 相机权限。
+
+---
+
+## `Bootstrap failed: 5: Input/output error`
+
+新版 `scripts/install-agent.sh` 已经包含更完整的旧任务清理逻辑。
+
+一般重新执行即可：
+
+```bash
+./scripts/install-agent.sh
+```
+
+如果仍然失败，可以检查：
+
+```bash
+launchctl print "gui/$(id -u)/com.bh2voq.ps3eye-vcam"
+```
+
+以及：
+
+```bash
+plutil -lint "$HOME/Library/LaunchAgents/com.bh2voq.ps3eye-vcam.plist"
+```
+
+---
+
+## 日志里看到旧的 `pthread_mutex_lock` assertion
+
+日志文件是追加写入的，所以顶部的 assertion 不一定属于当前 feeder 进程。
+
+先清空日志再重新测试：
+
+```bash
+: > "$HOME/Library/Logs/PS3Eye-VirtualCam/feed.log"
+launchctl kickstart -k "gui/$(id -u)/com.bh2voq.ps3eye-vcam"
+```
+
+再观察新的日志。
+
+---
+
+# 后台管理
+
+## 手动重启 feeder
+
+```bash
+launchctl kickstart -k \
+"gui/$(id -u)/com.bh2voq.ps3eye-vcam"
+```
+
+## 卸载 LaunchAgent
+
+```bash
+./scripts/uninstall-agent.sh
+```
+
+---
+
+# 项目结构
+
+| 路径 | 作用 |
+|---|---|
+| `src/ps3eye-feed.mm` | PS3 Eye 抓帧、NV12 转换、CoreMediaIO 推流、手动状态控制 |
+| `src/ps3eye/` | PS3EYEDriver / OV534 用户态驱动 |
+| `src/app/PS3EyeVCMenu.m` | macOS 菜单栏控制 App |
+| `lib/libusb/` | arm64 静态 libusb |
+| `build.sh` | 构建 feeder |
+| `scripts/build-app.sh` | 构建菜单栏 App |
+| `scripts/install-agent.sh` | 安装并注册后台 LaunchAgent |
+| `scripts/uninstall-agent.sh` | 卸载 LaunchAgent |
+| `.github/workflows/macos-build.yml` | macOS CI 构建验证 |
+
+---
+
+# 当前设计取舍与已知限制
+
+### 当前优先级：稳定性 > 全自动
+
+目前已经确认：OBS Camera Extension 没有向外部 feeder 暴露一个可靠的“当前 source 客户端数量”接口。
+
+因此当前版本不会再尝试根据不可靠信号自动关机。
+
+也就是说：
+
+- **开启由用户手动控制；**
+- **关闭由用户手动控制；**
+- 一旦开启，本次会话不会因为错误的消费者检测而周期性掉线。
+
+这是当前最稳定的工作模式。
+
+### 为什么不直接自己实现 Camera Extension
+
+完全自研 Camera Extension 可以在 extension 内部直接获得客户端生命周期，因此理论上可以实现真正可靠的自动开关。
+
+但它会明显增加：
+
+- Camera Extension 工程复杂度；
+- 签名与安装复杂度；
+- macOS 不同版本兼容成本；
+- 发布和维护成本。
+
+当前项目优先复用 OBS 官方扩展，以保持部署简单。
+
+---
+
+# 构建验证
+
+仓库包含 macOS GitHub Actions：
+
+```text
+.github/workflows/macos-build.yml
+```
+
+CI 会验证：
+
+```bash
+./build.sh
+./scripts/build-app.sh
+```
+
+这能覆盖编译级回归，但无法替代真实 PS3 Eye USB 硬件测试。
+
+---
+
+# License
+
+本项目按 GPLv2 分发，详见：
+
+- [`LICENSE`](LICENSE)
+- [`LICENSE-PS3EYEDriver`](LICENSE-PS3EYEDriver)
+
+项目使用或参考：
+
+- PS3EYEDriver
+- libusb
+- OBS macOS Virtual Camera / Camera Extension
+
+感谢相关开源项目的工作。
