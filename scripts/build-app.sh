@@ -28,9 +28,9 @@ cat > "$APP/Contents/Info.plist" << 'PLIST'
 	<key>CFBundleDisplayName</key>
 	<string>PS3 Eye 虚拟摄像头</string>
 	<key>CFBundleVersion</key>
-	<string>0.1.1</string>
+	<string>0.1.2</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.1.1-beta</string>
+	<string>0.1.2-beta</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>LSMinimumSystemVersion</key>
