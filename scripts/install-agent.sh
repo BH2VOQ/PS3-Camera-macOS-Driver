@@ -9,6 +9,8 @@ AGENT_DIR="$HOME/Library/LaunchAgents"
 PLIST="$AGENT_DIR/com.bh2voq.ps3eye-vcam.plist"
 LOG="$HOME/Library/Logs/PS3Eye-VirtualCam/feed.log"
 LABEL="com.bh2voq.ps3eye-vcam"
+DOMAIN="gui/$(id -u)"
+SERVICE="$DOMAIN/$LABEL"
 
 mkdir -p "$SUPPORT" "$AGENT_DIR" "$(dirname "$LOG")"
 cp -f bin/ps3eye-feed "$SUPPORT/ps3eye-feed"
@@ -32,10 +34,31 @@ cat > "$PLIST" << EOF
 </plist>
 EOF
 
-# 先卸载旧的再装新的（幂等），保证升级后立即运行新 feeder
-launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
-launchctl bootstrap "gui/$(id -u)" "$PLIST"
-launchctl enable "gui/$(id -u)/$LABEL" 2>/dev/null || true
+chmod 644 "$PLIST"
+plutil -lint "$PLIST" >/dev/null
+
+# 干净卸载旧任务。不同 macOS 版本对 service target / plist path 的 bootout
+# 行为略有差异，因此两种形式都尝试，并清掉可能残留的旧 feeder 进程。
+launchctl disable "$SERVICE" 2>/dev/null || true
+launchctl bootout "$SERVICE" 2>/dev/null || true
+launchctl bootout "$DOMAIN" "$PLIST" 2>/dev/null || true
+pkill -x ps3eye-feed 2>/dev/null || true
+sleep 1
+
+launchctl enable "$SERVICE" 2>/dev/null || true
+if ! launchctl bootstrap "$DOMAIN" "$PLIST"; then
+    echo "❌ LaunchAgent bootstrap 失败。当前诊断："
+    echo "   plist: $PLIST"
+    plutil -p "$PLIST" || true
+    launchctl print "$SERVICE" 2>/dev/null || true
+    echo ""
+    echo "可手动执行以下命令获取更完整的 launchd 错误："
+    echo "launchctl bootout '$DOMAIN' '$PLIST' 2>/dev/null || true"
+    echo "launchctl bootstrap '$DOMAIN' '$PLIST'"
+    exit 1
+fi
+
+launchctl kickstart -k "$SERVICE" 2>/dev/null || true
 
 sleep 2
 if pgrep -x ps3eye-feed >/dev/null; then
