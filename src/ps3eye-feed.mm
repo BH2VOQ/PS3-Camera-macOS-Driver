@@ -26,6 +26,27 @@ static NSString *controlPath() {
     return [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/PS3Eye-VirtualCam/enabled"];
 }
 
+static NSString *supportDirPath() {
+    return [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/PS3Eye-VirtualCam"];
+}
+static NSString *statePath() {
+    return [supportDirPath() stringByAppendingPathComponent:@"feed.state"];
+}
+static NSString *pidPath() {
+    return [supportDirPath() stringByAppendingPathComponent:@"feed.pid"];
+}
+
+// 菜单栏 App 每秒读这个几十字节的状态文件，替代原先"整读 feed.log 再取最后一行"。
+// 只在状态切换时写，原子替换，读端不会看到半截内容。
+static void writeFeedState(const char *state) {
+    NSString *text = [NSString stringWithFormat:@"%s", state];
+    [text writeToFile:statePath() atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
+static void writeFeedPid(void) {
+    NSString *text = [NSString stringWithFormat:@"%d", (int)getpid()];
+    [text writeToFile:pidPath() atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
+
 static bool manualEnabled() {
     NSString *value = [NSString stringWithContentsOfFile:controlPath()
                                                     encoding:NSUTF8StringEncoding
@@ -186,6 +207,7 @@ int main(int argc, char *argv[]) {
         (void)argc; (void)argv;
         fprintf(stderr, "[ps3eye-feed] starting (manual control mode)\n");
         if (!acquireSingleInstanceLock()) return 1;
+        writeFeedPid();
         signal(SIGINT, on_signal);
         signal(SIGTERM, on_signal);
 
@@ -208,9 +230,12 @@ int main(int argc, char *argv[]) {
         cam->setAutoWhiteBalance(true);
         cam->setBrightness(24);
         cam->setLed(false);
+        writeFeedState("starting");
         fprintf(stderr, "[ps3eye-feed] PS3 Eye standby; manual switch is OFF\n");
 
+        bool announcedStandby = false;
         while (g_running && !manualEnabled()) {
+            if (!announcedStandby) { writeFeedState("standby"); announcedStandby = true; }
             usleep(100 * 1000);
         }
         if (!g_running) std::_Exit(0);
@@ -268,6 +293,7 @@ int main(int argc, char *argv[]) {
 
         cam->start();
         cam->setLed(true);
+        writeFeedState("streaming");
         fprintf(stderr, "[ps3eye-feed] PS3 Eye streaming 640x480@30 (manual ON)\n");
 
         std::vector<uint8_t> bgr(kWidth * kHeight * 3);
@@ -290,12 +316,21 @@ int main(int argc, char *argv[]) {
             }
         });
 
+        // control 文件不必每帧读；100ms 一次对手动开关的响应依然是无感的。
+        int64_t lastControlNs = 0;
+        bool manual = true;
         while (g_running) {
             cam->getFrame(bgr.data());
             int64_t nowNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
             lastFrameNs.store(nowNs, std::memory_order_relaxed);
 
-            if (!manualEnabled()) {
+            if (nowNs - lastControlNs > 100 * NSEC_PER_MSEC) {
+                lastControlNs = nowNs;
+                manual = manualEnabled();
+            }
+
+            if (!manual) {
+                writeFeedState("standby");
                 fprintf(stderr, "[ps3eye-feed] manual switch OFF; physical camera entering standby\n");
                 cam->setLed(false);
                 fflush(stderr);
@@ -304,7 +339,8 @@ int main(int argc, char *argv[]) {
 
             if (queue && CMSimpleQueueGetFullness(queue) < 1.0 && enqueueFrame(bgr.data())) {
                 frameCount++;
-                if (frameCount % 30 == 0)
+                // 30fps 下每 900 帧 = 30 秒一行，够证明活着，又不至于把日志灌成几十 MB。
+                if (frameCount % 900 == 0)
                     fprintf(stderr, "[ps3eye-feed] %llu frames sent\n", (unsigned long long)frameCount);
             }
         }

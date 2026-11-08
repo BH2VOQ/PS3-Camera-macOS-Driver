@@ -1,6 +1,9 @@
 // PS3EyeVCMenu.m — PS3 Eye virtual camera menu bar controller
 // LaunchAgent stays resident; menu bar controls the physical camera state.
 #import <Cocoa/Cocoa.h>
+#import <errno.h>
+#import <signal.h>
+#import <unistd.h>
 
 #define AGENT_LABEL @"com.bh2voq.ps3eye-vcam"
 #define APP_AGENT_LABEL @"com.bh2voq.ps3eye-vcam-app"
@@ -21,6 +24,12 @@ static NSString *controlPath(void) {
 }
 static NSString *agentPlistPath(void) {
     return [NSHomeDirectory() stringByAppendingPathComponent:@"Library/LaunchAgents/com.bh2voq.ps3eye-vcam.plist"];
+}
+static NSString *statePath(void) {
+    return [supportDir() stringByAppendingPathComponent:@"feed.state"];
+}
+static NSString *pidPath(void) {
+    return [supportDir() stringByAppendingPathComponent:@"feed.pid"];
 }
 static NSString *logPath(void) {
     NSString *dir = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Logs/PS3Eye-VirtualCam"];
@@ -43,8 +52,15 @@ static int runShell(NSString *cmd) {
 static NSString *uidString(void) {
     return [NSString stringWithFormat:@"%d", (int)getuid()];
 }
+// 原先每秒 fork 一次 /bin/bash -c "pgrep -x ps3eye-feed"，实测单次约 15ms。
+// 改为读 feeder 自己写的 feed.pid 再 kill(pid, 0) 探活，零 fork。
 static BOOL feedRunning(void) {
-    return runShell(@"pgrep -x ps3eye-feed >/dev/null 2>&1") == 0;
+    NSString *raw = [NSString stringWithContentsOfFile:pidPath() encoding:NSUTF8StringEncoding error:nil];
+    if (!raw) return NO;
+    NSInteger pid = [[raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] integerValue];
+    if (pid <= 0) return NO;
+    if (kill((pid_t)pid, 0) == 0) return YES;
+    return errno == EPERM;
 }
 static BOOL agentLoaded(void) {
     NSString *cmd = [NSString stringWithFormat:@"launchctl print gui/%@/%@ >/dev/null 2>&1", uidString(), AGENT_LABEL];
@@ -168,15 +184,12 @@ static void ensureAppAgent(void) {
     return [lang isEqualToString:@"zh"];
 }
 
-- (NSString *)lastLogLine {
-    NSString *log = [NSString stringWithContentsOfFile:logPath() encoding:NSUTF8StringEncoding error:nil];
-    if (!log) return @"";
-    NSArray<NSString *> *lines = [log componentsSeparatedByString:@"\n"];
-    for (NSInteger i = lines.count - 1; i >= 0; i--) {
-        NSString *l = [lines[i] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-        if (l.length > 0) return l;
-    }
-    return @"";
+// 原实现每秒把整个 feed.log 读进内存、componentsSeparatedByString 拆成全部行、只取最后一行。
+// 日志涨到 6.9MB（21 万行）时，这等于每秒分配 6.9MB 字符串 + 21 万元素数组，
+// 实测空转占 30-46% CPU。现在改读 feeder 写的几十字节状态文件。
+- (NSString *)feedState {
+    NSString *s = [NSString stringWithContentsOfFile:statePath() encoding:NSUTF8StringEncoding error:nil];
+    return [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] ?: @"";
 }
 
 - (void)applyLanguage {
@@ -245,12 +258,12 @@ static void ensureAppAgent(void) {
     BOOL zh = [self isChinese];
     BOOL enabled = cameraEnabled();
     BOOL running = feedRunning();
-    NSString *last = [self lastLogLine];
+    NSString *feedState = [self feedState];
     NSString *state;
 
     if (!running) state = zh ? @"后台未运行" : @"Background Not Running";
     else if (!enabled) state = zh ? @"待机（摄像头已关闭）" : @"Standby (Camera Off)";
-    else if ([last containsString:@"frames sent"] || [last containsString:@"streaming"]) state = zh ? @"推流中" : @"Streaming";
+    else if ([feedState isEqualToString:@"streaming"]) state = zh ? @"推流中" : @"Streaming";
     else state = zh ? @"启动中…" : @"Starting...";
 
     self.toggleItem.title = enabled ? (zh ? @"关闭摄像头" : @"Disable Camera") : (zh ? @"启用摄像头" : @"Enable Camera");
